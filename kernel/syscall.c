@@ -1,0 +1,1021 @@
+#include "syscall.h"
+#include "fs.h"
+#include "gui.h"
+#include "io.h"
+#include "heap.h"
+#include "keyboard.h"
+#include "klog.h"
+#include "scheduler.h"
+#include "lst.h"
+#include "paging.h"
+#include "rtc.h"
+#include "timer.h"
+#include "uapp.h"
+#include "sound.h"
+#include "net.h"
+#include "serial.h"
+#include "sysinfo.h"
+#include "acpi.h"
+#include "blkdev.h"
+#include "bootinfo.h"
+#include "user.h"
+#include "util.h"
+#include "kapi.h"
+#include "pci.h"
+
+#define UFD_MAX 8
+#define UPKG_MAX 4
+#define UFILE_MAX (16 * 1024 * 1024)
+
+typedef struct {
+    int  used;
+    int  writing;
+    char path[160];
+    u8  *buf;
+    u32  size;
+    u32  cap;
+    u32  pos;
+} ufd_t;
+
+typedef struct {
+    int  used;
+    u8  *data;
+    u32  size;
+} upkg_t;
+
+/* MMIO 窗口：放在用户代码（0xC0000000）与用户栈（0xEF800000）之间的一段空区。
+ * 单调向上分配，不做回收 —— 驱动初始化是一次性的，够用且简单。 */
+#define MMIO_WINDOW_BASE 0xE0000000u
+#define MMIO_WINDOW_END  0xEF000000u
+
+static u32 mmio_next_va = MMIO_WINDOW_BASE;
+
+/* 判断一段物理地址是否属于 E820 里的可用 RAM。
+ * 这是 MMIO 映射的护栏：如果允许映射 RAM，用户态程序就能读写整个物理内存，
+ * 等于把内核和所有进程的数据全部暴露。 */
+static int phys_in_ram(u32 phys, u32 size)
+{
+    e820_entry_t *e = (e820_entry_t *)(u32)BOOTINFO->e820_addr;
+    u32 n = BOOTINFO->e820_count;
+
+    if (!e || !n)
+        return 1;                      /* 拿不到 E820 时一律拒绝，宁可映射失败 */
+
+    for (u32 i = 0; i < n && i < E820_MAX_ENTRIES; i++) {
+        u64 b, l, end;
+
+        if (e[i].type != 1)
+            continue;
+        b = e[i].base;
+        if (b > 0xFFFFFFFFull)
+            continue;
+        l = e[i].length;
+        if (!l)
+            continue;
+        end = b + l;
+        if ((u64)phys + size > b && (u64)phys < end)
+            return 1;
+    }
+    return 0;
+}
+
+static u32 mmio_alloc_va(u32 size)
+{
+    u32 v = mmio_next_va;
+
+    size = (size + 0xFFFu) & ~0xFFFu;
+    if (v + size > MMIO_WINDOW_END)
+        return 0;
+    mmio_next_va = v + size;
+    return v;
+}
+
+static ufd_t ufds[UFD_MAX];
+static upkg_t upkgs[UPKG_MAX];
+static void (*out_fn)(const char *buf, u32 len);
+
+
+void syscall_brk_init(u32 top)
+{
+    scheduler_set_brk_base(top);
+    scheduler_set_brk(top);
+}
+
+void syscall_brk_free(void)
+{
+    /* 收缩回起点：解映射堆页 */
+    u32 top = scheduler_brk();
+    u32 base = scheduler_brk_base();
+    u32 cur = (top - 1) & ~0xFFFu;
+    while (cur >= base) {
+        paging_unmap_user(cur, PAGE_SIZE);
+        if (cur < PAGE_SIZE)
+            break;
+        cur -= PAGE_SIZE;
+    }
+    scheduler_set_brk(base);
+}
+
+void syscall_set_output(void (*fn)(const char *buf, u32 len))
+{
+    out_fn = fn;
+}
+
+void syscall_set_args(const char *a0, const char *a1)
+{
+    (void)a0;
+    (void)a1;
+    /* 多进程下参数在 scheduler_spawn 时写入任务表 */
+}
+
+void syscall_init(void)
+{
+    memset(ufds, 0, sizeof(ufds));
+    memset(upkgs, 0, sizeof(upkgs));
+    out_fn = NULL;
+}
+
+static int uok(u32 ptr, u32 len)
+{
+    return user_ok(ptr, len);
+}
+
+static int ustr(u32 uptr, char *dst, u32 max)
+{
+    return user_strncpy(dst, uptr, max);
+}
+
+static u32 last_pump;
+
+/* 用户程序在 ring 3 里跑的时候，GUI 主循环只在"内核上下文"里转。
+   让每个系统调用都顺手把 GUI 推一轮（限流到 ~60 Hz），
+   这样哪怕调度器把时间片全给了某个爱刷屏的程序，
+   窗口和光标也不会整个冻住。 */
+static void pump(void)
+{
+    u32 now = timer_uptime_ms();
+    if (now - last_pump < 16)
+        return;
+    last_pump = now;
+    gui_poll();
+}
+
+static void uprint(const char *s, u32 len)
+{
+    if (out_fn)
+        out_fn(s, len);
+    else
+        for (u32 i = 0; i < len; i++)
+            kprintf("%c", s[i]);
+}
+
+static int fd_alloc(void)
+{
+    for (int i = 3; i < UFD_MAX; i++)
+        if (!ufds[i].used)
+            return i;
+    return -1;
+}
+
+static int sys_open(u32 upath, u32 mode)
+{
+    char path[160];
+    int fd;
+    int len;
+
+    if (ustr(upath, path, sizeof(path)) != 0)
+        return -1;
+    fd = fd_alloc();
+    if (fd < 0)
+        return -1;
+
+    {
+        u8 *keep = ufds[fd].buf;
+        memset(&ufds[fd], 0, sizeof(ufds[fd]));
+        ufds[fd].buf = keep;
+    }
+    strncpy(ufds[fd].path, path, sizeof(ufds[fd].path) - 1);
+    ufds[fd].used = 1;
+    ufds[fd].cap = UFILE_MAX;
+
+    if (mode == 0) {
+        fs_dirent_t st;
+        u32 need = UFILE_MAX;
+
+        if (fs_resolve(path, &st) != 0) {
+            ufds[fd].used = 0;
+            return -2;
+        }
+        if (st.size + 32 > need)
+            need = st.size + 32;
+        if (!ufds[fd].buf || ufds[fd].cap < need) {
+            ufds[fd].buf = (u8 *)kmalloc(need);
+            if (!ufds[fd].buf) {
+                ufds[fd].used = 0;
+                return -1;
+            }
+            ufds[fd].cap = need;
+        }
+        len = fs_read(path, ufds[fd].buf, ufds[fd].cap);
+        if (len < 0) {
+            kprintf("[sys] open %s read fail (%d)\n", path, len);
+            ufds[fd].used = 0;
+            return -2;
+        }
+        #ifdef KB_SYSCALL_TRACE
+        kprintf("[sys] open %s size=%d got=%d cap=%d\n", path, (int)st.size, len, (int)ufds[fd].cap);
+        #endif
+        ufds[fd].size = (u32)len;
+        ufds[fd].pos = 0;
+    } else {
+        if (!ufds[fd].buf) {
+            ufds[fd].buf = (u8 *)kmalloc(UFILE_MAX);
+            if (!ufds[fd].buf) {
+                ufds[fd].used = 0;
+                return -1;
+            }
+            ufds[fd].cap = UFILE_MAX;
+        }
+        ufds[fd].writing = 1;
+        ufds[fd].size = 0;
+    }
+    return fd;
+}
+
+static int sys_close(u32 fd)
+{
+    if (fd < 3 || fd >= UFD_MAX || !ufds[fd].used)
+        return -1;
+    if (ufds[fd].writing) {
+        if (fs_write(ufds[fd].path, ufds[fd].buf, ufds[fd].size) < 0) {
+            ufds[fd].used = 0;
+            return -2;
+        }
+    }
+    ufds[fd].used = 0;
+    return 0;
+}
+
+static int sys_list(u32 upath, u32 index, u32 ubuf, u32 bufsize)
+{
+    char path[160];
+    char name[64];
+    fs_dirent_t e;
+
+    if (ustr(upath, path, sizeof(path)) != 0)
+        return -1;
+    if (fs_list(path, (int)index, &e) != 0)
+        return -1;
+    snprintf(name, sizeof(name), "%s", e.name);
+    if (bufsize < strlen(name) + 1)
+        return -2;
+    if (!uok(ubuf, (u32)strlen(name) + 1))
+        return -1;
+    memcpy((void *)ubuf, name, strlen(name) + 1);
+    return (e.flags & FS_FLAG_DIR) ? -3 : (int)e.size;
+}
+
+static int sys_pkg_open(u32 upath)
+{
+    char path[160];
+    int len;
+    int h;
+    u8 *data;
+
+    if (ustr(upath, path, sizeof(path)) != 0)
+        return -1;
+
+    for (h = 0; h < UPKG_MAX; h++)
+        if (!upkgs[h].used)
+            break;
+    if (h >= UPKG_MAX)
+        return -2;
+
+    data = (u8 *)kmalloc(512 * 1024);
+    if (!data)
+        return -3;
+    len = fs_read(path, data, 512 * 1024);
+    if (len < 0) {
+        return -4;
+    }
+    if (!lst_validate(data, (u32)len)) {
+        kprintf("[pkg] %s is not a valid .lst package\n", path);
+        return -5;
+    }
+    upkgs[h].used = 1;
+    upkgs[h].data = data;
+    upkgs[h].size = (u32)len;
+    return h;
+}
+
+static int sys_pkg_info(u32 h, u32 index, u32 ubuf, u32 bufsize)
+{
+    const lst_entry_t *e;
+
+    if (h >= UPKG_MAX || !upkgs[h].used)
+        return -1;
+    e = lst_entry(upkgs[h].data, upkgs[h].size, index);
+    if (!e)
+        return -1;
+    if (bufsize < 32)
+        return -2;
+    if (!uok(ubuf, 32))
+        return -1;
+    memcpy((void *)ubuf, e->name, 32);
+    return (int)e->size;
+}
+
+static int sys_pkg_extract(u32 h, u32 index, u32 udest)
+{
+    const lst_entry_t *e;
+    const u8 *payload;
+    char dest[160];
+
+    if (h >= UPKG_MAX || !upkgs[h].used)
+        return -1;
+    e = lst_entry(upkgs[h].data, upkgs[h].size, index);
+    if (!e)
+        return -1;
+    if (ustr(udest, dest, sizeof(dest)) != 0)
+        return -1;
+    payload = lst_payload(upkgs[h].data, upkgs[h].size, index, NULL);
+    if (!payload)
+        return -1;
+    if (fs_write(dest, payload, e->size) < 0)
+        return -2;
+    return (int)e->size;
+}
+
+void syscall_dispatch(regs_t *r)
+{
+    u32 n = r->eax;
+
+    __asm__ volatile("sti");
+    u32 a = r->ebx, b = r->ecx, c = r->edx, d = r->esi, e = r->edi;
+    s32 ret = -1;
+    char tmp[160];
+
+    switch (n) {
+    case SYS_EXIT:
+        uapp_close();
+        scheduler_exit((int)a);
+        break;
+
+    case SYS_WRITE:
+        if (a == USER_FD_STDOUT || a == USER_FD_STDERR) {
+            u32 len = c;
+            if (len > 4096)
+                len = 4096;
+            if (uok(b, len) == 0)
+                break;
+            uprint((const char *)b, len);
+            pump();
+            ret = (s32)len;
+        } else if (a < UFD_MAX && ufds[a].used && ufds[a].writing) {
+            u32 len = c;
+            if (ufds[a].size + len > ufds[a].cap)
+                len = ufds[a].cap - ufds[a].size;
+            if (uok(b, len) == 0)
+                break;
+            memcpy(ufds[a].buf + ufds[a].size, (const void *)b, len);
+            ufds[a].size += len;
+            ret = (s32)len;
+        }
+        break;
+
+    case SYS_READKEY:
+        /* 有窗口的 app 只读自己窗口的队列（后台挂起等待，不去抢内核键盘队列）；
+           没有窗口的 app 仍可读终端键盘 */
+        while (!(uapp_open_window() ? uapp_haskey() : keyboard_has_key())) {
+            pump();
+            hlt();
+        }
+        pump();
+        ret = uapp_open_window() ? uapp_getkey() : keyboard_getkey();
+        break;
+
+    case SYS_GETKEY:
+        ret = uapp_open_window() ? uapp_getkey() : keyboard_getkey();
+        break;
+
+    case SYS_OPEN:
+        ret = sys_open(a, b);
+        break;
+
+    case SYS_CLOSE:
+        ret = sys_close(a);
+        break;
+
+    case SYS_READ:
+        if (a >= 3 && a < UFD_MAX && ufds[a].used && !ufds[a].writing) {
+            u32 want = c;
+            u32 avail = ufds[a].size - ufds[a].pos;
+            if (want > avail)
+                want = avail;
+            if (uok(b, want) == 0)
+                break;
+            memcpy((void *)b, ufds[a].buf + ufds[a].pos, want);
+            ufds[a].pos += want;
+            ret = (s32)want;
+        }
+        break;
+
+    case SYS_MKDIR:
+        if (ustr(a, tmp, sizeof(tmp)) == 0)
+            ret = (fs_mkdir(tmp) == 0) ? 0 : -2;
+        break;
+
+    case SYS_UNLINK:
+        if (ustr(a, tmp, sizeof(tmp)) == 0)
+            ret = (fs_delete(tmp) == 0) ? 0 : -2;
+        break;
+
+    case SYS_LIST:
+        ret = sys_list(a, b, c, d);
+        break;
+
+    case SYS_EXISTS:
+        if (ustr(a, tmp, sizeof(tmp)) == 0)
+            ret = fs_exists(tmp) ? 1 : 0;
+        break;
+
+    case SYS_ISDIR:
+        if (ustr(a, tmp, sizeof(tmp)) == 0)
+            ret = fs_is_dir(tmp) ? 1 : 0;
+        break;
+
+    case SYS_SLEEP:
+        scheduler_block_ms(a);
+        ret = 0;
+        break;
+
+    case SYS_TIME:
+        if (uok(a, 24)) {
+            int *t = (int *)a;
+            rtc_time_t now;
+            rtc_read(&now);
+            t[0] = now.year;
+            t[1] = now.month;
+            t[2] = now.day;
+            t[3] = now.hour;
+            t[4] = now.minute;
+            t[5] = now.second;
+            ret = 0;
+        }
+        break;
+
+    case SYS_ARGS:
+        {
+            char ta0[160], ta1[160];
+            scheduler_get_args(ta0, ta1, sizeof(ta0));
+            if (a == 0) {
+                if (uok(b, (u32)strlen(ta0) + 1)) {
+                    memcpy((void *)b, ta0, strlen(ta0) + 1);
+                    ret = 0;
+                }
+            } else if (!ta1[0]) {
+                if (uok(b, 1)) {
+                    *(char *)b = 0;
+                    ret = 0;
+                }
+            } else if (uok(b, (u32)strlen(ta1) + 1)) {
+                memcpy((void *)b, ta1, strlen(ta1) + 1);
+                ret = 0;
+            }
+        }
+        break;
+
+    case SYS_PKG_OPEN:
+        ret = sys_pkg_open(a);
+        break;
+
+    case SYS_PKG_COUNT:
+        if (a < UPKG_MAX && upkgs[a].used)
+            ret = lst_count(upkgs[a].data);
+        break;
+
+    case SYS_PKG_INFO:
+        ret = sys_pkg_info(a, b, c, d);
+        break;
+
+    case SYS_PKG_EXTRACT:
+        ret = sys_pkg_extract(a, b, c);
+        break;
+
+    case SYS_WIN_OPEN:
+        if (uok(a, 1)) {
+            const char *title = (const char *)a;
+            if (ustr(a, tmp, sizeof(tmp)) == 0)
+                title = tmp;
+            ret = uapp_open(title, (int)b, (int)c);
+        }
+        break;
+
+    case SYS_WIN_CLEAR:
+        uapp_clear(a);
+        ret = 0;
+        break;
+
+    case SYS_GFX_RECT:
+        uapp_rect((int)a, (int)b, (int)c, (int)d, r->edi);
+        ret = 0;
+        break;
+
+    case SYS_WIN_FRAME:
+        uapp_frame((int)a, (int)b, (int)c, (int)d, r->edi);
+        ret = 0;
+        break;
+
+    case SYS_GFX_TEXT:
+        if (ustr(c, tmp, sizeof(tmp)) == 0) {
+            uapp_text((int)a, (int)b, tmp, d, (int)r->edi);
+            ret = 0;
+        }
+        break;
+
+    case SYS_WIN_FLUSH:
+        uapp_flush();
+        pump();
+        ret = 0;
+        break;
+
+    case SYS_MOUSE:
+        {
+            int mx, my, mb, inside;
+            uapp_mouse(&mx, &my, &mb, &inside);
+            if (uok(a, 4))
+                *(int *)a = mx;
+            if (uok(b, 4))
+                *(int *)b = my;
+            if (uok(c, 4))
+                *(int *)c = mb;
+            if (uok(d, 4))
+                *(int *)d = inside;
+            ret = 0;
+        }
+        break;
+
+    case SYS_WIN_SIZE:
+        ret = (uapp_width() << 16) | (uapp_height() & 0xFFFF);
+        break;
+
+    case SYS_PUMP:
+        gui_cursor_refresh();
+        ret = 0;
+        break;
+
+    case SYS_TICKS:
+        ret = (s32)timer_ticks();
+        break;
+
+    case SYS_POWEROFF:
+        kprintf("[setup] powering off via ACPI S5\n");
+        acpi_shutdown();
+        cli();
+        for (;;)
+            hlt();
+        break;
+
+    case SYS_BOOTMODE:
+        ret = (s32)BOOTINFO->boot_drive;
+        break;
+
+    case SYS_RAWWRITE:
+        {
+            u32 lba = b;
+            u32 count = c;
+            if (ustr(a, tmp, sizeof(tmp)) != 0)
+                break;
+            if (count == 0 || count > 4096)
+                break;
+            if (!uok(d, count * 512))
+                break;
+            {
+                int dev = blk_find(tmp);
+                if (dev < 0)
+                    break;
+                if (blk_write(dev, lba, count, (const void *)d) != 0)
+                    break;
+                ret = (s32)count;
+            }
+        }
+        break;
+
+    case SYS_REBOOT:
+        kprintf("[setup] rebooting\n");
+        gui_poll();
+        acpi_reboot();
+        cli();
+        for (;;)
+            hlt();
+        break;
+
+    case SYS_DISK_INFO:
+        {
+            const blk_info_t *bi = blk_info((int)a);
+            if (!bi || !bi->present) {
+                ret = 0;
+                break;
+            }
+            if (uok(b, 16)) {
+                char *nm = (char *)b;
+                int k;
+                for (k = 0; k < 15 && bi->name[k]; k++)
+                    nm[k] = bi->name[k];
+                nm[k] = 0;
+            }
+            if (uok(c, 4))
+                *(u32 *)c = bi->sectors;
+            if (uok(d, 4))
+                *(u32 *)d = (u32)bi->type;
+            ret = 1;
+        }
+        break;
+
+    case SYS_INSTALL:
+        if (ustr(a, tmp, sizeof(tmp)) == 0) {
+            int dev = blk_find(tmp);
+            if (dev < 0) {
+                ret = -1;
+                break;
+            }
+            ret = (s32)fs_install(dev, b, "aptos");
+            if (ret != 0)
+                kprintf("[vfs] install on %s failed: %d (base %d)\n", tmp, ret, (int)b);
+        }
+        break;
+
+    case SYS_INSTALL_FAT:
+        if (ustr(a, tmp, sizeof(tmp)) == 0) {
+            int dev = blk_find(tmp);
+            if (dev < 0) {
+                ret = -1;
+                break;
+            }
+            ret = (s32)fs_install_fat(dev, b, "aptos", (int)c);
+            if (ret != 0)
+                kprintf("[vfs] fat install on %s failed: %d (base %d type %d)\n",
+                        tmp, ret, (int)b, (int)c);
+        }
+        break;
+
+    case SYS_FILEWRITE:
+        if (a >= 3 && a < UFD_MAX && ufds[a].used && ufds[a].writing) {
+            u32 want = c;
+            if (ufds[a].size + want > ufds[a].cap)
+                want = ufds[a].cap - ufds[a].size;
+            if (want > 0 && uok(b, want)) {
+                memcpy(ufds[a].buf + ufds[a].size, (void *)b, want);
+                ufds[a].size += want;
+                ret = (s32)want;
+            }
+        }
+        break;
+
+    case SYS_SYSINFO:
+        kprintf("[dbg] SYSINFO a=0x%x size=%u uok=%d\n", a, (u32)sizeof(sysinfo_t), uok(a, sizeof(sysinfo_t)));
+        if (uok(a, sizeof(sysinfo_t)) != 0) {
+            sysinfo_fill((sysinfo_t *)a);
+            ret = sizeof(sysinfo_t);
+            kprintf("[dbg] SYSINFO ok ret=%d magic=0x%x\n", ret, *(u32 *)a);
+        }
+        break;
+
+    case SYS_BEEP:
+        beep(a, b);
+        ret = 0;
+        break;
+    case SYS_NET_INFO:
+        if (uok(a, sizeof(netinfo_t)) != 0) {
+            net_getinfo((netinfo_t *)a);
+            ret = sizeof(netinfo_t);
+        } else {
+            ret = -1;
+        }
+        break;
+
+    case SYS_TCP_CONNECT:
+        {
+            char ipbuf[40];
+            int i;
+            u32 ip;
+            if (!uok(a, 1)) {
+                ret = -1;
+                break;
+            }
+            for (i = 0; i < 39; i++) {
+                if (!uok(a + i, 1)) {
+                    ipbuf[i] = 0;
+                    break;
+                }
+                ipbuf[i] = *(char *)(a + i);
+                if (ipbuf[i] == 0)
+                    break;
+            }
+            ipbuf[39] = 0;
+            ip = net_aton(ipbuf);
+            if (ip == 0) {
+                ret = -1;
+                break;
+            }
+            ret = net_tcp_connect(ip, (u16)(b & 0xFFFF));
+        }
+        break;
+
+    case SYS_TCP_SEND:
+        if (uok(b, c > 0 ? c : 1) != 0 && c > 0)
+            ret = net_tcp_send((const void *)b, (u32)c);
+        else
+            ret = -1;
+        break;
+
+    case SYS_TCP_RECV:
+        if (uok(b, c > 0 ? c : 1) != 0 && c > 0)
+            ret = net_tcp_recv((void *)b, (u32)c, (u32)d);
+        else
+            ret = -1;
+        break;
+
+    case SYS_TCP_CLOSE:
+        ret = net_tcp_close();
+        break;
+
+    case SYS_TCP_LISTEN:
+        ret = net_tcp_listen((u16)(b & 0xFFFF));
+        break;
+
+    case SYS_TCP_ACCEPT:
+        ret = net_tcp_accept();
+        break;
+
+    case SYS_DNS_QUERY:
+        {
+            char name[128];
+            int i;
+            u32 ip = 0;
+            if (!uok(a, 1) || !uok(b, 4)) {
+                ret = -1;
+                break;
+            }
+            for (i = 0; i < 127; i++) {
+                if (!uok(a + i, 1)) {
+                    name[i] = 0;
+                    break;
+                }
+                name[i] = *(char *)(a + i);
+                if (name[i] == 0)
+                    break;
+            }
+            name[127] = 0;
+            if (net_dns_query(name, &ip) == 0) {
+                *(u32 *)b = ip;
+                ret = 0;
+            } else {
+                ret = -1;
+            }
+        }
+        break;
+
+
+    case SYS_GFX_LINE:
+        uapp_line(a, b, c, d, (u32)e);
+        ret = 0;
+        break;
+
+    case SYS_GFX_BLIT:
+        {
+            u32 ptr = (u32)e;
+            u32 sz = (u32)((u32)c * (u32)d * 4);
+            if (uok(ptr, sz))
+                uapp_blit((int)a, (int)b, (int)c, (int)d, (const u32 *)ptr);
+            ret = 0;
+        }
+        break;
+
+    case SYS_BRK:
+        {
+            u32 want = a;
+            if (want == 0 || want <= scheduler_brk_base()) {
+                ret = (s32)scheduler_brk();
+                break;
+            }
+            if (want > (USER_STACK_TOP - USER_STACK_SIZE - PAGE_SIZE * 2)) {
+                ret = -1;
+                break;
+            }
+            if (want > scheduler_brk()) {
+                u32 cur = scheduler_brk();
+                while (cur <= want + PAGE_SIZE) {
+                    u32 phys = (u32)kmalloc_a(PAGE_SIZE, PAGE_SIZE);
+                    if (!phys) {
+                        ret = -1;
+                        break;
+                    }
+                    memset((void *)phys, 0, PAGE_SIZE);
+                    if (paging_map_user(cur, phys, PAGE_SIZE, 1) != 0) {
+                        ret = -1;
+                        break;
+                    }
+                    cur += PAGE_SIZE;
+                }
+                scheduler_set_brk(cur);
+            } else {
+                u32 cur = (scheduler_brk() - 1) & ~0xFFFu;
+                while (cur >= want) {
+                    paging_unmap_user(cur, PAGE_SIZE);
+                    if (cur < PAGE_SIZE)
+                        break;
+                    cur -= PAGE_SIZE;
+                }
+                scheduler_set_brk(want);
+            }
+            ret = (s32)scheduler_brk();
+        }
+        break;
+
+    /* ---- 进程管理 API（用户态可互相启动，不再只能靠内核桌面） ---- */
+    case SYS_SPAWN:
+        {
+            char path[160];
+            char arg0[160];
+            char name[24];
+            fs_dirent_t ent;
+            u8 *buf;
+            int n;
+
+            if (ustr(a, path, sizeof(path)) != 0)
+                break;
+            arg0[0] = 0;
+            if (b)
+                ustr(b, arg0, sizeof(arg0));
+            if (fs_resolve(path, &ent) != 0)
+                break;
+            if (ent.flags & FS_FLAG_DIR)
+                break;
+            if (ent.size < 128 || ent.size > 8 * 1024 * 1024)
+                break;
+            buf = (u8 *)kmem_alloc(ent.size);
+            if (!buf)
+                break;
+            n = fs_read(path, buf, ent.size);
+            if (n <= 0) {
+                kmem_free(buf);
+                break;
+            }
+            {
+                const char *bn = fs_basename(path);
+                u32 i = 0;
+                while (bn[i] && bn[i] != '.' && i + 1 < sizeof(name)) {
+                    name[i] = bn[i];
+                    i++;
+                }
+                name[i] = 0;
+            }
+            ret = scheduler_spawn(buf, (u32)n, name, arg0, NULL);
+            kmem_free(buf);
+        }
+        break;
+
+    case SYS_WAIT:
+        {
+            int pid = (int)a;
+
+            if (pid < 0 || pid >= MAX_TASKS || pid == scheduler_cur_id())
+                break;
+            while (scheduler_alive(pid)) {
+                scheduler_block_ms(5);
+                pump();
+            }
+            ret = scheduler_status(pid);
+            scheduler_reap_zombie(pid);
+        }
+        break;
+
+    case SYS_KILL:
+        ret = scheduler_kill((int)a);
+        break;
+
+    case SYS_GETPID:
+        ret = scheduler_cur_id();
+        break;
+
+    case SYS_PROCINFO:
+        {
+            int pid = (int)a;
+            char nm[24];
+            u32 st;
+
+            if (!uok(b, 40) || pid < 0 || pid >= MAX_TASKS)
+                break;
+            kstrlcpy(nm, scheduler_name(pid), sizeof(nm));
+            st = (u32)(scheduler_alive(pid) ? 1 : 0);
+            if (copy_to_user(b, nm, 24) != 0)
+                break;
+            if (copy_to_user(b + 24, &st, 4) != 0)
+                break;
+            if (copy_to_user(b + 28, &(u32){ (u32)scheduler_cur_id() }, 4) != 0)
+                break;
+            ret = 0;
+        }
+        break;
+
+    case SYS_PCI:
+        /* a=bus, b=dev, c=(fn<<8)|reg —— fn 只占 3 位，reg 取低 8 位并对齐 */
+        ret = (s32)pci_read((u8)a, (u8)b, (u8)((c >> 8) & 0x7), (u8)(c & 0xFC));
+        break;
+
+    case SYS_PCI_BAR:
+        /* a=bus, b=dev, c=(fn<<8)|baridx；返回 BAR 窗口大小 */
+        ret = (s32)pci_bar_size((u8)a, (u8)b, (u8)((c >> 8) & 0x7), (u8)(c & 0x7));
+        break;
+
+    case SYS_MMAP_IO: {
+        /* a=设备物理地址, b=长度。返回用户态可直接解引用的虚拟地址，失败为 0。
+         * 页面打 PCD，绕过 cache —— 设备寄存器必须每次真读。 */
+        u32 phys = a;
+        u32 sz = b;
+        u32 pbase, off, vbase;
+
+        if (!sz || sz > (4u << 20))
+            break;
+        pbase = phys & ~0xFFFu;
+        off = phys - pbase;
+        sz = (u32)((off + sz + 0xFFFu) & ~0xFFFu);
+        if (phys_in_ram(pbase, sz)) {
+            kprintf("[mmio] refuse to map RAM at %x\n", phys);
+            break;
+        }
+        vbase = mmio_alloc_va(sz);
+        if (!vbase)
+            break;
+        if (paging_map_user_io(vbase, pbase, sz) != 0)
+            break;
+        ret = (s32)(vbase + off);
+        break;
+    }
+
+    case SYS_PORT_IN:
+        /* a=port, b=width(1/2/4)。ring3 不能直接 in，必须由内核代劳 */
+        if (a < 0x10000) {
+            if (b == 1)
+                ret = (s32)inb((u16)a);
+            else if (b == 2)
+                ret = (s32)inw((u16)a);
+            else
+                ret = (s32)inl((u32)a);
+        }
+        break;
+
+    case SYS_PORT_OUT:
+        /* a=port, b=value, c=width(1/2/4) */
+        if (a < 0x10000) {
+            if (c == 1)
+                outb((u16)a, (u8)b);
+            else if (c == 2)
+                outw((u16)a, (u16)b);
+            else
+                outl((u32)a, (u32)b);
+            ret = 0;
+        }
+        break;
+
+    case SYS_SERIAL_GETC:
+        ret = serial_getc();
+        break;
+
+    case SYS_NET_SETIP:
+        net_set_ip((u32)a, (u32)b, (u32)c);
+        ret = 0;
+        break;
+
+    case SYS_PRINTN: {
+        /* 直接打印一个有符号十进制数，给用户态调试用 */
+        char digits[16];
+        char out[20];
+        int v = (int)a, k = 0, j = 0, neg = 0;
+
+        if (v < 0) { neg = 1; v = -v; }
+        if (v == 0)
+            digits[k++] = '0';
+        while (v > 0) {
+            digits[k++] = (char)('0' + (v % 10));
+            v /= 10;
+        }
+        if (neg)
+            out[j++] = '-';
+        while (k > 0)
+            out[j++] = digits[--k];
+        uprint(out, (u32)j);
+        ret = 0;
+        break;
+    }
+
+    default:
+        break;
+    }
+
+    r->eax = (u32)ret;
+
+    /* 所有系统调用返回前都让 GUI 有机会推进（内部有 16 ms 限流） */
+    pump();
+}

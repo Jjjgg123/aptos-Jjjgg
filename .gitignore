@@ -1,0 +1,28 @@
+# 构建产物
+build/
+kbuild/
+build_orig/
+_/
+*.o
+*.bin
+*.app
+*.elf
+*.img
+*.iso
+*.vdi
+*.vmdk
+*.vhd
+
+# 备份与临时文件
+*.bak
+*.canary.bak
+*.tmp
+*~
+
+# Python
+__pycache__/
+*.pyc
+
+# 编辑器
+.vscode/
+.idea/

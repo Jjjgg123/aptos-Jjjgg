@@ -1,0 +1,323 @@
+#include "uapp.h"
+#include "font8x8.h"
+#include "gfx.h"
+#include "gui.h"
+#include "heap.h"
+#include "klog.h"
+#include "mouse.h"
+#include "util.h"
+
+#define FONT_W 8
+#define FONT_H 8
+#define UAPP_MAX_W 1004
+#define UAPP_MAX_H 700
+
+static u32 *canvas;
+static int cw, ch;
+static window_t *uwin;
+static int have_window;
+
+/* 应用自己的显示空间变化了：只标脏自己的窗口，不惊动整个桌面 */
+static void uapp_touch(void)
+{
+    if (uwin && have_window)
+        gui_dirty_window(uwin);
+    else
+        gui_dirty();
+}
+static char title_buf[32];
+
+/* user-mode keyboard ring buffer fed by the gui key dispatcher */
+#define UKEY_BUF 128
+static volatile int  ukey[UKEY_BUF];
+static volatile u32  ukey_head, ukey_tail;
+
+static void uapp_key(window_t *w, int k, int mods)
+{
+    u32 next = (ukey_head + 1) % UKEY_BUF;
+    if (next == ukey_tail)
+        return;
+    ukey[ukey_head] = k;
+    ukey_head = next;
+}
+
+int uapp_haskey(void) { return ukey_head != ukey_tail; }
+
+int uapp_getkey(void)
+{
+    if (ukey_head == ukey_tail)
+        return -1;
+    int k = ukey[ukey_tail];
+    ukey_tail = (ukey_tail + 1) % UKEY_BUF;
+    return k;
+}
+
+int uapp_focused(void)
+{
+    return uwin && gui_focused() == uwin;
+}
+
+static void uapp_draw(window_t *w)
+{
+    if (!canvas)
+        return;
+    gfx_set_clip(w->cx, w->cy, w->cx + w->cw - 1, w->cy + w->ch - 1);
+    gfx_blit(w->cx, w->cy, cw, ch, canvas);
+    gfx_reset_clip();
+}
+
+static app_t uapp_app = {
+    "app", 640, 480, NULL, uapp_draw, uapp_key, NULL, NULL, NULL
+};
+
+int uapp_width(void) { return cw; }
+int uapp_height(void) { return ch; }
+int uapp_open_window(void) { return have_window; }
+
+int uapp_open(const char *title, int w, int h)
+{
+    u8 *buf;
+
+    if (w < 64)
+        w = 64;
+    if (h < 64)
+        h = 64;
+    if (w > UAPP_MAX_W)
+        w = UAPP_MAX_W;
+    if (h > UAPP_MAX_H)
+        h = UAPP_MAX_H;
+
+    if (!canvas || w > cw || h > ch) {
+        buf = (u8 *)kmalloc((size_t)w * (size_t)h * 4);
+        if (!buf) {
+            kprintf("[uapp] out of memory for a %dx%d canvas\n", w, h);
+            return -1;
+        }
+        canvas = (u32 *)buf;
+        cw = w;
+        ch = h;
+    }
+
+    memset(canvas, 0, (size_t)cw * (size_t)ch * 4);
+    strncpy(title_buf, title ? title : "application", sizeof(title_buf) - 1);
+    title_buf[sizeof(title_buf) - 1] = 0;
+    uapp_app.title = title_buf;
+    uapp_app.width = w;
+    uapp_app.height = h;
+
+    if (!uwin) {
+        uwin = gui_open(&uapp_app);
+        if (!uwin) {
+            kprintf("[uapp] could not open a window\n");
+            return -1;
+        }
+    } else {
+        gui_resize(uwin, w, h);
+    }
+    have_window = 1;
+
+    gfx_reset_clip();
+    gui_focus(uwin);
+    uapp_clear(RGB(28, 34, 46));
+    uapp_flush();
+    return 0;
+}
+
+void uapp_clear(u32 color)
+{
+    int i, n = cw * ch;
+
+    uapp_touch();
+    if (!canvas)
+        return;
+    for (i = 0; i < n; i++)
+        canvas[i] = color;
+}
+
+void uapp_rect(int x, int y, int w, int h, u32 color)
+{
+    uapp_touch();
+    if (!canvas)
+        return;
+    if (x < 0) {
+        w += x;
+        x = 0;
+    }
+    if (y < 0) {
+        h += y;
+        y = 0;
+    }
+    if (x + w > cw)
+        w = cw - x;
+    if (y + h > ch)
+        h = ch - y;
+    if (w <= 0 || h <= 0)
+        return;
+
+    for (int row = y; row < y + h; row++) {
+        u32 *d = canvas + (size_t)row * cw + x;
+        for (int col = 0; col < w; col++)
+            d[col] = color;
+    }
+}
+
+void uapp_line(int x0, int y0, int x1, int y1, u32 color)
+{
+    uapp_touch();
+    if (!canvas)
+        return;
+    int dx = (x1 > x0) ? (x1 - x0) : (x0 - x1);
+    int dy = (y1 > y0) ? (y1 - y0) : (y0 - y1);
+    int sx = (x0 < x1) ? 1 : -1;
+    int sy = (y0 < y1) ? 1 : -1;
+    int err = dx - dy;
+    for (;;) {
+        if (x0 >= 0 && x0 < cw && y0 >= 0 && y0 < ch)
+            canvas[(size_t)y0 * cw + x0] = color;
+        if (x0 == x1 && y0 == y1)
+            break;
+        int e2 = err << 1;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 < dx)  { err += dx; y0 += sy; }
+    }
+}
+
+void uapp_frame(int x, int y, int w, int h, u32 color)
+{
+    uapp_touch();
+    uapp_rect(x, y, w, 1, color);
+    uapp_rect(x, y + h - 1, w, 1, color);
+    uapp_rect(x, y, 1, h, color);
+    uapp_rect(x + w - 1, y, 1, h, color);
+}
+
+static int utf8_decode_u(const char *s, u32 *out)
+{
+    u8 c = (u8)s[0];
+    if (c < 0x80) {
+        *out = c;
+        return 1;
+    }
+    if (c >= 0xC2 && c < 0xE0 && ((u8)s[1] & 0xC0) == 0x80) {
+        *out = ((u32)(c & 0x1F) << 6) | ((u8)s[1] & 0x3F);
+        return 2;
+    }
+    if (c >= 0xE0 && c < 0xF0 && ((u8)s[1] & 0xC0) == 0x80 &&
+        ((u8)s[2] & 0xC0) == 0x80) {
+        *out = ((u32)(c & 0x0F) << 12) | (((u8)s[1] & 0x3F) << 6) | ((u8)s[2] & 0x3F);
+        return 3;
+    }
+    *out = '?';
+    return 1;
+}
+
+static void uapp_draw_ascii(int x, int y, unsigned char c, u32 color, int scale)
+{
+    const unsigned char *glyph = font8x8_basic[c];
+    for (int row = 0; row < FONT_H; row++) {
+        u8 bits = glyph[row];
+        for (int col = 0; col < FONT_W; col++) {
+            if (bits & (1u << col))
+                uapp_rect(x + col * scale, y + row * scale, scale, scale, color);
+        }
+    }
+}
+
+void uapp_text(int x, int y, const char *s, u32 color, int scale)
+{
+    uapp_touch();
+    if (!canvas || !s)
+        return;
+    if (scale < 1)
+        scale = 1;
+
+    int gx = x;
+    const char *p = s;
+    while (*p) {
+        u32 cp;
+        int n = utf8_decode_u(p, &cp);
+        if (cp < 0x80) {
+            uapp_draw_ascii(gx, y, (unsigned char)cp, color, scale);
+            gx += FONT_W * scale;
+        } else if (cp > 0xFFFF) {
+            uapp_draw_ascii(gx, y, '?', color, scale);
+            gx += FONT_W * scale;
+        } else {
+            const u8 *g = (const u8 *)gfx_font16_glyph((unsigned short)cp);
+            if (!g) {
+                uapp_draw_ascii(gx, y, '?', color, scale);
+                gx += FONT_W * scale;
+            } else {
+                /* 16x16 位图按 8 高降采样（每两行 OR 合并），保持 16 宽 */
+                for (int r = 0; r < 8; r++) {
+                    u16 bits = (u16)(((u16)g[(r * 2) * 2] << 8) | g[(r * 2) * 2 + 1]);
+                    bits |= (u16)(((u16)g[(r * 2 + 1) * 2] << 8) | g[(r * 2 + 1) * 2 + 1]);
+                    for (int c = 0; c < 16; c++) {
+                        if (bits & (u16)(1u << (15 - c)))
+                            uapp_rect(gx + c * scale, y + r * scale, scale, scale, color);
+                    }
+                }
+                gx += 16 * scale;
+            }
+        }
+        p += n;
+    }
+}
+
+void uapp_blit(int dx, int dy, int w, int h, const u32 *src)
+{
+    uapp_touch();
+    int i, j;
+    if (!canvas || !src)
+        return;
+    for (j = 0; j < h; j++) {
+        int yy = dy + j;
+        if (yy < 0 || yy >= ch)
+            continue;
+        for (i = 0; i < w; i++) {
+            int xx = dx + i;
+            if (xx < 0 || xx >= cw)
+                continue;
+            canvas[(size_t)yy * cw + xx] = src[(size_t)j * w + i];
+        }
+    }
+}
+
+void uapp_flush(void)
+{
+    if (!uwin || !canvas)
+        return;
+    gfx_set_clip(uwin->cx, uwin->cy, uwin->cx + uwin->cw - 1, uwin->cy + uwin->ch - 1);
+    gfx_blit(uwin->cx, uwin->cy, cw, ch, canvas);
+    gfx_reset_clip();
+    gfx_present_rect(uwin->x, uwin->y, uwin->w, uwin->h);
+    gui_cursor_refresh();
+}
+
+void uapp_mouse(int *x, int *y, int *buttons, int *inside)
+{
+    int mx, my, mb;
+
+    mouse_get(&mx, &my, &mb);
+    if (uwin) {
+        mx -= uwin->cx;
+        my -= uwin->cy;
+    }
+    if (x)
+        *x = mx;
+    if (y)
+        *y = my;
+    if (buttons)
+        *buttons = mb;
+    if (inside)
+        *inside = (uwin && mx >= 0 && my >= 0 && mx < cw && my < ch) ? 1 : 0;
+}
+
+void uapp_close(void)
+{
+    if (uwin) {
+        gui_close(uwin);
+        uwin = NULL;
+    }
+    have_window = 0;
+}

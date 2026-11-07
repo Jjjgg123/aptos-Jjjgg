@@ -1,0 +1,1311 @@
+#include "gui.h"
+#include "fs.h"
+#include "io.h"
+#include "kapi.h"
+#include "keyboard.h"
+#include "klog.h"
+#include "mouse.h"
+#include "rtc.h"
+#include "timer.h"
+#include "util.h"
+
+/* 可选特性：每个应用分配自己的显示空间（默认关闭，走原来的直接绘制路径）。
+   打开后应用只在自己的缓冲里画，系统负责合成。 */
+#ifndef GUI_SURFACE
+#define GUI_SURFACE 0
+#endif
+
+#define MAX_WINDOWS 8
+
+#define C_DESK_TOP   RGB(26, 34, 58)
+#define C_DESK_BOT   RGB(10, 13, 22)
+#define C_LOGO       RGB(38, 50, 78)
+#define C_LOGO_SUB   RGB(30, 40, 62)
+#define C_WIN_BG     RGB(30, 34, 42)
+#define C_WIN_EDGE   RGB(74, 82, 96)
+#define C_TITLE_A    RGB(52, 118, 210)
+#define C_TITLE_B    RGB(34, 78, 150)
+#define C_TITLE_UA   RGB(58, 64, 76)
+#define C_TITLE_UB   RGB(46, 51, 62)
+#define C_TEXT       RGB(226, 232, 242)
+#define C_DIM        RGB(146, 156, 172)
+#define C_TASKBAR    RGB(17, 20, 27)
+#define C_TASK_EDGE  RGB(58, 68, 88)
+#define C_BTN        RGB(52, 58, 70)
+#define C_BTN_HOT    RGB(72, 122, 200)
+#define C_BTN_EDGE   RGB(96, 106, 126)
+#define C_SHADOW     RGB(6, 8, 12)
+
+static window_t  windows[MAX_WINDOWS];
+static window_t *zorder[MAX_WINDOWS];
+static int       zcount;
+static int       scene_dirty;
+/* 脏矩形：只有部分区域变化时做局部重绘，不再整屏重画 */
+static rect_t    dirty;
+static int       dirty_valid;
+
+#ifdef GUI_TRACE
+#define GTRACE(...) kprintf(__VA_ARGS__)
+#else
+#define GTRACE(...) ((void)0)
+#endif
+
+void gui_dirty(void) { scene_dirty = 1; dirty_valid = 0; }
+
+/* 立即整屏重绘并提交（定义在 repaint_rect 之后） */
+void gui_repaint_all(void);
+
+void gui_dirty_rect(int x0, int y0, int x1, int y1)
+{
+    if (x1 < x0 || y1 < y0)
+        return;
+    if (!dirty_valid) {
+        dirty.x0 = x0; dirty.y0 = y0; dirty.x1 = x1; dirty.y1 = y1;
+        dirty_valid = 1;
+        return;
+    }
+    if (x0 < dirty.x0) dirty.x0 = x0;
+    if (y0 < dirty.y0) dirty.y0 = y0;
+    if (x1 > dirty.x1) dirty.x1 = x1;
+    if (y1 > dirty.y1) dirty.y1 = y1;
+}
+
+/* 请求重绘某个窗口（含边框与阴影） */
+void gui_dirty_window(window_t *w)
+{
+    if (!w || !w->used) {
+        gui_dirty();
+        return;
+    }
+    gui_dirty_rect(w->x - 1, w->y - 1, w->x + w->w + 4, w->y + w->h + 4);
+}
+static int       start_menu_open;
+static int       input_enabled = 1;
+static char      clock_text[10] = "--:--:--";
+static u32       clock_tick;
+
+#define CURSOR_W 12
+#define CURSOR_H 19
+
+static const char *cursor_shape[CURSOR_H] = {
+    "1...........",
+    "11..........",
+    "121.........",
+    "1221........",
+    "12221.......",
+    "122221......",
+    "1222221.....",
+    "12222221....",
+    "122222221...",
+    "1222222221..",
+    "12222222221.",
+    "122222222221",
+    "122222211111",
+    "1221..1221..",
+    "121...1221..",
+    "11.....1221.",
+    "1......1221.",
+    "........1221",
+    ".........11."
+};
+
+static int  cur_x = -1, cur_y = -1;
+static u32  cursor_under[CURSOR_W * CURSOR_H];
+static int  cursor_saved;
+
+static window_t *focused_window;
+static window_t *mouse_grab;
+static int dragging;
+static int drag_dx, drag_dy;
+
+window_t *gui_focused(void) { return focused_window; }
+
+#define ICON_W   76
+#define ICON_H   62
+#define ICON_ROWS 9
+#define ICON_COLS 3
+#define ICON_TOP 10
+#define ICON_LEFT 10
+#define ICON_MAX (ICON_ROWS * ICON_COLS)
+
+static void set_content_rect(window_t *w)
+{
+    w->cx = w->x + GUI_BORDER;
+    w->cy = w->y + GUI_TITLE_H + GUI_BORDER;
+    w->cw = w->w - GUI_BORDER * 2;
+    w->ch = w->h - GUI_TITLE_H - GUI_BORDER * 2;
+}
+
+/* 按 level 插入 zorder：低层在前（先画），高层在后（后画、压在上面）。
+   同一层内保持"后插入者更靠上"的直觉。 */
+static void zorder_insert(window_t *w)
+{
+    int pos = 0, i;
+
+    for (i = 0; i < zcount; i++)
+        if (zorder[i]->level <= w->level)
+            pos = i + 1;
+
+    for (i = zcount; i > pos; i--)
+        zorder[i] = zorder[i - 1];
+    zorder[pos] = w;
+    zcount++;
+}
+
+static void raise_window(window_t *w)
+{
+    int idx = -1, i;
+
+    if (w->flags & WIN_FRAMELESS)
+        return;
+
+    for (i = 0; i < zcount; i++)
+        if (zorder[i] == w)
+            idx = i;
+    if (idx < 0)
+        return;
+
+    if (idx == zcount - 1 && w->level >= zorder[idx]->level)
+        return;
+
+    for (i = idx; i < zcount - 1; i++)
+        zorder[i] = zorder[i + 1];
+    zcount--;
+
+    zorder_insert(w);
+}
+
+void gui_focus(window_t *w)
+{
+    if (!w || (w->flags & WIN_FRAMELESS))
+        return;
+    focused_window = w;
+    raise_window(w);
+    gui_dirty();
+}
+
+void gui_resize(window_t *w, int cw, int ch)
+{
+    int maxw = gfx_width() - 2 * GUI_BORDER;
+    int maxh = gfx_height() - GUI_TASKBAR_H - GUI_TITLE_H - 4 * GUI_BORDER;
+
+    if (cw > maxw) cw = maxw;
+    if (ch > maxh) ch = maxh;
+    w->w = cw + GUI_BORDER * 2;
+    w->h = ch + GUI_TITLE_H + GUI_BORDER * 2;
+    if (w->x + w->w > gfx_width())
+        w->x = gfx_width() - w->w;
+    if (w->x < 0)
+        w->x = 0;
+    if (w->y + w->h > gfx_height() - GUI_TASKBAR_H)
+        w->y = 20;
+    set_content_rect(w);
+#if GUI_SURFACE
+    if (w->buf) {
+        kmem_free(w->buf);
+        w->buf = NULL;
+    }
+    w->buf = (u32 *)kmem_alloc((size_t)w->cw * (size_t)w->ch * 4);
+    if (w->buf) {
+        w->bw = w->cw;
+        w->bh = w->ch;
+        memset(w->buf, 0, (size_t)w->cw * (size_t)w->ch * 4);
+    }
+#endif
+    gui_dirty();
+}
+
+window_t *gui_open(const app_t *app)
+{
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (windows[i].used && windows[i].app == app) {
+            gui_focus(&windows[i]);
+            return &windows[i];
+        }
+    }
+    if (zcount >= MAX_WINDOWS)
+        return NULL;
+
+    window_t *w = NULL;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (!windows[i].used) {
+            w = &windows[i];
+            break;
+        }
+    }
+    if (!w)
+        return NULL;
+
+    memset(w, 0, sizeof(*w));
+    w->used = 1;
+    w->app = app;
+
+    int cw = app->width;
+    int ch = app->height;
+    int maxw = gfx_width() - 2 * GUI_BORDER;
+    int maxh = gfx_height() - GUI_TASKBAR_H - GUI_TITLE_H - 4 * GUI_BORDER;
+    if (cw > maxw) cw = maxw;
+    if (ch > maxh) ch = maxh;
+
+    w->w = cw + GUI_BORDER * 2;
+    w->h = ch + GUI_TITLE_H + GUI_BORDER * 2;
+
+    {
+        int step = 26 * zcount;
+        int desk = ICON_LEFT + ICON_COLS * ICON_W + 12;
+        w->x = desk + step;
+        w->y = 24 + step;
+        if (w->x + w->w > gfx_width())
+            w->x = gfx_width() - w->w - 10;
+        if (w->x < 8)
+            w->x = 8;
+        if (w->y + w->h > gfx_height() - GUI_TASKBAR_H)
+            w->y = 20;
+    }
+    set_content_rect(w);
+
+#if GUI_SURFACE
+    w->buf = (u32 *)kmem_alloc((size_t)w->cw * (size_t)w->ch * 4);
+    if (w->buf) {
+        w->bw = w->cw;
+        w->bh = w->ch;
+        memset(w->buf, 0, (size_t)w->cw * (size_t)w->ch * 4);
+    } else {
+        kprintf("[gui] no surface for %s (%dx%d), falling back to direct draw\n",
+                app->title, w->cw, w->ch);
+    }
+#endif
+
+    zorder_insert(w);
+    focused_window = w;
+    if (app->init)
+        app->init(w);
+    gui_dirty();
+    return w;
+}
+
+window_t *gui_open_child(const app_t *app, window_t *owner)
+{
+    window_t *w;
+
+    /* 同一个 app 已经开着：只置顶，绝不能把它的 owner/level 改掉，
+       否则关掉父窗口会误伤这个正常窗口 */
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (windows[i].used && windows[i].app == app) {
+            gui_focus(&windows[i]);
+            return &windows[i];
+        }
+    }
+
+    w = gui_open(app);
+    if (!w)
+        return NULL;
+    w->owner = owner;
+    w->level = owner ? owner->level + 1 : 1;
+    raise_window(w);
+    gui_dirty();
+    return w;
+}
+
+void gui_close(window_t *w)
+{
+    /* 级联关子窗时只在最外层重绘一次 */
+    static int close_depth;
+
+    if (!w || !w->used || (w->flags & WIN_FRAMELESS))
+        return;
+    close_depth++;
+    if (w->app->close)
+        w->app->close(w);
+
+    /* 上级关闭时，挂在它上面的下级窗口一起关 */
+    for (int i = zcount - 1; i >= 0; i--)
+        if (zorder[i] && zorder[i]->owner == w)
+            gui_close(zorder[i]);
+
+    int idx = -1;
+    for (int i = 0; i < zcount; i++)
+        if (zorder[i] == w)
+            idx = i;
+    if (idx >= 0) {
+        for (int i = idx; i < zcount - 1; i++)
+            zorder[i] = zorder[i + 1];
+        zcount--;
+    }
+    w->used = 0;
+    w->state = NULL;
+    w->owner = NULL;
+#if GUI_SURFACE
+    if (w->buf) {
+        kmem_free(w->buf);
+        w->buf = NULL;
+        w->bw = w->bh = 0;
+    }
+#endif
+    if (focused_window == w)
+        focused_window = zcount ? zorder[zcount - 1] : NULL;
+    if (mouse_grab == w)
+        mouse_grab = NULL;
+    gui_dirty();
+
+    /* 窗口消失是整屏拓扑变化：这里直接重绘并提交，不依赖 gui_poll 的下一轮。
+       否则关闭后残影只能等下一次鼠标移动/局部刷新才被覆盖。 */
+    close_depth--;
+    if (close_depth == 0) {
+        GTRACE("[close] '%s' -> zcount=%d\n",
+               w->app && w->app->title ? w->app->title : "?", zcount);
+        gui_repaint_all();
+    }
+}
+
+void ui_panel(int x, int y, int w, int h, u32 bg)
+{
+    gfx_fill_rect(x, y, w, h, bg);
+}
+
+void ui_text(int x, int y, const char *s, u32 color)
+{
+    gfx_text(x, y, s, color, 1);
+}
+
+int ui_button(int x, int y, int w, int h, const char *label, int active)
+{
+    gfx_fill_rect(x, y, w, h, active ? C_BTN_HOT : C_BTN);
+    gfx_rect(x, y, w, h, C_BTN_EDGE);
+    int tw = gfx_text_w(label, 1);
+    gfx_text(x + (w - tw) / 2, y + (h - 8) / 2, label, C_TEXT, 1);
+    return 0;
+}
+
+static const app_t *menu_apps[] = {
+    &app_terminal, &app_files, &app_editor, &app_paint, &app_about,
+    &app_snake, &app_mines, &app_2048
+};
+#define MENU_ITEMS ((int)ARRAY_LEN(menu_apps))
+#define MENU_ITEM_H 22
+#define MENU_W 150
+
+static int in_rect(int x, int y, int rx, int ry, int rw, int rh);
+static int icon_selected = -1;
+
+#define ICON_W   76
+#define ICON_H   62
+#define ICON_ROWS 9
+#define ICON_COLS 3
+#define ICON_TOP 10
+#define ICON_LEFT 10
+#define ICON_MAX (ICON_ROWS * ICON_COLS)
+
+typedef struct {
+    char name[24];
+    char path[160];
+    int  is_system;
+    int  app_index;
+    int  is_folder;
+    int  col;
+    int  row;
+} desktop_icon_t;
+
+static desktop_icon_t icons[ICON_ROWS * ICON_COLS];
+static int icon_count;
+static u32 icon_scan_tick;
+
+static int icon_add(int *n, int col, int row, const char *name, const char *path,
+                    int is_system, int app_index, int is_folder)
+{
+    desktop_icon_t *ic;
+
+    if (*n >= ICON_MAX || col >= ICON_COLS || row >= ICON_ROWS)
+        return -1;
+    ic = &icons[(*n)++];
+    memset(ic, 0, sizeof(*ic));
+    strncpy(ic->name, name, sizeof(ic->name) - 1);
+    if (path)
+        strncpy(ic->path, path, sizeof(ic->path) - 1);
+    ic->is_system = is_system;
+    ic->app_index = app_index;
+    ic->is_folder = is_folder;
+    ic->col = col;
+    ic->row = row;
+    return 0;
+}
+
+typedef struct {
+    int n;
+    int col;
+    int row;
+} icon_scan_t;
+
+/* /APPS 里的 .APP -> 桌面图标（跨列排布，摆满为止） */
+static int icon_app_cb(const fs_dirent_t *e, void *ctx)
+{
+    icon_scan_t *st = (icon_scan_t *)ctx;
+    int len;
+    char nm[24];
+    char path[160];
+
+    if (e->flags & FS_FLAG_DIR)
+        return 0;
+    len = (int)strlen(e->name);
+    if (len < 5 || strcasecmp(e->name + len - 4, ".APP") != 0)
+        return 0;
+    if (st->col >= ICON_COLS)
+        return 1;                       /* 摆满了，提前结束遍历 */
+    strncpy(nm, e->name, sizeof(nm) - 1);
+    nm[sizeof(nm) - 1] = 0;
+    if (len - 4 < (int)sizeof(nm))
+        nm[len - 4] = 0;
+    snprintf(path, sizeof(path), "/APPS/%s", e->name);
+    if (icon_add(&st->n, st->col, st->row, nm, path, 0, 0, 0) != 0)
+        return 1;
+    if (++st->row >= ICON_ROWS) {
+        st->row = 0;
+        st->col++;
+    }
+    return 0;
+}
+
+/* 根目录的子目录 -> 文件夹图标 */
+static int icon_dir_cb(const fs_dirent_t *e, void *ctx)
+{
+    icon_scan_t *st = (icon_scan_t *)ctx;
+    char path[160];
+
+    if (!(e->flags & FS_FLAG_DIR))
+        return 0;
+    if (st->col >= ICON_COLS || st->row >= ICON_ROWS)
+        return 1;
+    snprintf(path, sizeof(path), "/%s", e->name);
+    if (icon_add(&st->n, st->col, st->row, e->name, path, 0, 0, 1) != 0)
+        return 1;
+    st->row++;
+    return 0;
+}
+
+static void icon_scan(void)
+{
+    icon_scan_t st;
+    int i;
+#ifdef ICON_DEBUG
+    u32 t_start = timer_ticks();
+#endif
+
+    icon_count = 0;
+    memset(&st, 0, sizeof(st));
+    st.col = 1;
+
+    /* 第一列：内置系统 app（右键菜单里同样可以打开） */
+    for (i = 0; i < MENU_ITEMS && i < ICON_ROWS; i++)
+        if (icon_add(&st.n, 0, i, menu_apps[i]->title, NULL, 1, i, 0) != 0)
+            break;
+
+    /* 第二、三列：一次遍历 /APPS（不再逐项 fs_list，避免 O(n^2) 磁盘读） */
+    if (fs_is_dir("/APPS"))
+        fs_dir_scan("/APPS", icon_app_cb, &st);
+
+    /* 剩余格位：根目录 */
+    if (st.col < ICON_COLS)
+        fs_dir_scan("/", icon_dir_cb, &st);
+
+    icon_count = st.n;
+    icon_scan_tick = timer_ticks();
+
+#ifdef ICON_DEBUG
+    kprintf("[icon] total=%d, %d ticks used\n", icon_count,
+            (int)(timer_ticks() - t_start));
+#endif
+}
+
+static void icon_rect(int index, int *ix, int *iy)
+{
+    *ix = ICON_LEFT + icons[index].col * ICON_W;
+    *iy = ICON_TOP + icons[index].row * ICON_H;
+}
+
+static int icon_scanned;
+
+static void icons_poll(void)
+{
+    int before;
+
+    if (icon_scanned && timer_ticks() - icon_scan_tick <= 2000)
+        return;
+    before = icon_count;
+    icon_scan();
+    icon_scanned = 1;
+    if (icon_count != before)
+        scene_dirty = 1;
+}
+
+static int icon_at(int x, int y, int *index)
+{
+    for (int i = 0; i < icon_count; i++) {
+        int ix, iy;
+        icon_rect(i, &ix, &iy);
+        if (in_rect(x, y, ix, iy, ICON_W - 6, ICON_H - 6)) {
+            *index = i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void draw_desktop(void)
+{
+    int i;
+
+    gfx_gradient(0, 0, gfx_width(), gfx_height(), C_DESK_TOP, C_DESK_BOT);
+
+    {
+        const char *logo = "aptos";
+        int lw = gfx_text_w(logo, 4);
+        gfx_text((gfx_width() - lw) / 2, gfx_height() / 2 - 60, logo, C_LOGO, 4);
+        {
+            const char *sub = "32-bit toy operating system - double-click a desktop icon";
+            int sw = gfx_text_w(sub, 1);
+            gfx_text((gfx_width() - sw) / 2, gfx_height() / 2 - 10, sub, C_LOGO_SUB, 1);
+        }
+    }
+
+    {
+        int mx, my, mb;
+        mouse_get(&mx, &my, &mb);
+
+        for (i = 0; i < icon_count; i++) {
+            int ix, iy, hot;
+            u32 face;
+            int sel = (i == icon_selected);
+
+            icon_rect(i, &ix, &iy);
+            hot = in_rect(mx, my, ix, iy, ICON_W - 6, ICON_H - 6);
+            face = (icons[i].is_system) ? RGB(64, 132, 196) : RGB(196, 128, 56);
+            if (icons[i].is_folder)
+                face = RGB(226, 176, 66);
+            if (icons[i].is_system) {
+                switch (icons[i].app_index) {
+                case 1: face = RGB(206, 168, 62); break;
+                case 2: face = RGB(160, 160, 168); break;
+                case 3: face = RGB(196, 88, 132); break;
+                case 4: face = RGB(96, 176, 128); break;
+                case 5: face = RGB(112, 176, 92); break;
+                case 6: face = RGB(176, 96, 88); break;
+                case 7: face = RGB(128, 112, 200); break;
+                default: break;
+                }
+            }
+
+            if (hot || sel)
+                gfx_fill_rect(ix + 1, iy + 1, ICON_W - 8, ICON_H - 8, C_BTN_HOT);
+
+            if (icons[i].is_folder) {
+                gfx_fill_rect(ix + 18, iy + 8, 16, 6, face);
+                gfx_fill_rect(ix + 14, iy + 12, 40, 24, face);
+                gfx_rect(ix + 14, iy + 12, 40, 24, RGB(120, 90, 20));
+                gfx_fill_rect(ix + 14, iy + 14, 40, 3,
+                              gfx_blend(face, RGB(255, 255, 255), 100));
+            } else {
+                gfx_fill_rect(ix + 14, iy + 6, 40, 30, face);
+                gfx_rect(ix + 14, iy + 6, 40, 30, RGB(20, 24, 32));
+                gfx_fill_rect(ix + 18, iy + 10, 32, 4,
+                              gfx_blend(face, RGB(255, 255, 255), 90));
+                gfx_fill_rect(ix + 18, iy + 18, 22, 3,
+                              gfx_blend(face, RGB(0, 0, 0), 60));
+                gfx_fill_rect(ix + 18, iy + 25, 26, 3,
+                              gfx_blend(face, RGB(0, 0, 0), 60));
+            }
+
+            {
+                int tw = gfx_text_w(icons[i].name, 1);
+                int tx = ix + (ICON_W - 6 - tw) / 2;
+                if (tx < ix + 1)
+                    tx = ix + 1;
+                gfx_text(tx, iy + 42, icons[i].name, C_TEXT, 1);
+            }
+        }
+    }
+}
+
+static void draw_close_button(window_t *w)
+{
+    int bx = w->x + w->w - 18;
+    int by = w->y + 4;
+    gfx_fill_rect(bx, by, 14, 13, RGB(190, 70, 70));
+    gfx_rect(bx, by, 14, 13, RGB(230, 130, 130));
+    gfx_line(bx + 4, by + 4, bx + 9, by + 9, COLOR_WHITE);
+    gfx_line(bx + 9, by + 4, bx + 4, by + 9, COLOR_WHITE);
+}
+
+/* 桌面本身也抽象成一个应用：接口和普通窗口一致，只是永远在最底层 */
+static void desktop_render(window_t *w)
+{
+    (void)w;
+    draw_desktop();
+}
+
+const app_t app_desktop = {
+    "Desktop", 0, 0, NULL, desktop_render, NULL, NULL, NULL, NULL
+};
+
+/* 桌面本身是一个窗口：全屏、无边框、level = -1 永远在最底。
+   它不占 windows[] 池、不参与焦点和拖动，但参与 z 序与脏区重绘，
+   这样"桌面"和普通应用走的是同一条渲染路径。 */
+static window_t desk_win;
+
+/* 窗口内容：应用自己提供的渲染入口；没写渲染器的应用借用终端的显示能力 */
+static void window_content_draw(window_t *w)
+{
+    if (w->app->draw) {
+        w->app->draw(w);
+        return;
+    }
+    if (w->app != &app_terminal && app_terminal.draw)
+        app_terminal.draw(w);
+    gfx_text(w->cx + 6, w->cy + 4, "(no renderer: mirroring terminal)",
+             RGB(190, 170, 110), 1);
+}
+
+static void draw_window(window_t *w)
+{
+    int active = (w == focused_window);
+    rect_t saved = gfx_get_clip();
+    rect_t inner;
+
+    if (w->flags & WIN_FRAMELESS) {
+        /* 桌面这种全屏无边框窗口：没有阴影、没有边框、没有标题栏，
+           只把内容画进外层给的那块裁剪区里。 */
+        gfx_set_clip_rect(saved);
+        window_content_draw(w);
+        return;
+    }
+
+    /* 整窗绘制（阴影 4px 已含在脏矩形里）都限制在外层给定的裁剪区内。
+       绝不能在这里 reset 成全屏：局部重绘只提交脏矩形，脏区外被改写的
+       像素不会 present，back buffer 会和屏幕慢慢分叉。 */
+    gfx_set_clip_rect(saved);
+    gfx_fill_rect(w->x + 4, w->y + 4, w->w, w->h, C_SHADOW);
+    gfx_fill_rect(w->x, w->y, w->w, w->h, C_WIN_EDGE);
+
+    int ty = w->y + 1;
+    int th = GUI_TITLE_H - 1;
+    gfx_gradient(w->x + 1, ty, w->w - 2, th,
+                 active ? C_TITLE_A : C_TITLE_UA,
+                 active ? C_TITLE_B : C_TITLE_UB);
+    gfx_text(w->x + 6, ty + (th - 8) / 2, w->app->title, COLOR_WHITE, 1);
+    draw_close_button(w);
+
+    gfx_fill_rect(w->cx, w->cy, w->cw, w->ch, C_WIN_BG);
+
+    /* 内容区 ∩ 外层脏区。gfx_set_clip 是覆盖而不是取交集，所以这里必须
+       自己算交集：否则把整窗内容 blit 进 back buffer，脏区外的像素被改写
+       却不会被 present，back 与屏幕从此分叉 —— 表现为"窗口重叠时好时坏"。 */
+    inner.x0 = w->cx;
+    inner.y0 = w->cy;
+    inner.x1 = w->cx + w->cw - 1;
+    inner.y1 = w->cy + w->ch - 1;
+    if (inner.x0 < saved.x0) inner.x0 = saved.x0;
+    if (inner.y0 < saved.y0) inner.y0 = saved.y0;
+    if (inner.x1 > saved.x1) inner.x1 = saved.x1;
+    if (inner.y1 > saved.y1) inner.y1 = saved.y1;
+
+#if GUI_SURFACE
+    if (w->buf) {
+        /* 把绘制目标切到该窗口自己的显示空间，应用照旧用自己的坐标画，
+           画完后系统把这块缓冲合成到屏幕上的窗口内容区 */
+        gfx_target_begin(w->buf, w->bw, w->bh, w->cx, w->cy);
+        gfx_set_clip(w->cx, w->cy, w->cx + w->cw - 1, w->cy + w->ch - 1);
+        /* 先铺底色：应用只负责自己的内容，背景由系统提供 */
+        gfx_fill_rect(w->cx, w->cy, w->cw, w->ch, C_WIN_BG);
+        window_content_draw(w);
+        gfx_target_end();
+        gfx_set_clip_rect(inner);
+        gfx_blit(w->cx, w->cy, w->bw, w->bh, w->buf);
+        gfx_set_clip_rect(saved);
+        return;
+    }
+#endif
+
+    gfx_set_clip_rect(inner);
+    window_content_draw(w);
+    gfx_set_clip_rect(saved);
+}
+
+static int menu_x(void) { return 4; }
+static int menu_y(void) { return gfx_height() - GUI_TASKBAR_H - MENU_ITEMS * MENU_ITEM_H - 10; }
+
+static void draw_start_menu(void)
+{
+    if (!start_menu_open)
+        return;
+    int x = menu_x(), y = menu_y();
+    int h = MENU_ITEMS * MENU_ITEM_H + 8;
+
+    gfx_fill_rect(x + 3, y + 3, MENU_W, h, C_SHADOW);
+    gfx_fill_rect(x, y, MENU_W, h, RGB(26, 30, 38));
+    gfx_rect(x, y, MENU_W, h, C_TASK_EDGE);
+
+    int mx, my, mb;
+    mouse_get(&mx, &my, &mb);
+
+    for (int i = 0; i < MENU_ITEMS; i++) {
+        int iy = y + 4 + i * MENU_ITEM_H;
+        int hot = (mx >= x && mx < x + MENU_W && my >= iy && my < iy + MENU_ITEM_H);
+        if (hot)
+            gfx_fill_rect(x + 2, iy, MENU_W - 4, MENU_ITEM_H, C_BTN_HOT);
+        gfx_text(x + 12, iy + 7, menu_apps[i]->title, C_TEXT, 1);
+    }
+}
+
+static void draw_taskbar(void)
+{
+    int y = gfx_height() - GUI_TASKBAR_H;
+    gfx_fill_rect(0, y, gfx_width(), GUI_TASKBAR_H, C_TASKBAR);
+    gfx_hline(0, y, gfx_width(), C_TASK_EDGE);
+
+    ui_button(4, y + 4, 52, 18, "aptos", start_menu_open);
+
+    int bx = 62;
+    for (int i = 0; i < zcount; i++) {
+        window_t *w = zorder[i];
+        int bw;
+        if (w->flags & WIN_FRAMELESS)
+            continue;
+        bw = gfx_text_w(w->app->title, 1) + 16;
+        if (bx + bw > gfx_width() - 70)
+            break;
+        ui_button(bx, y + 4, bw, 18, w->app->title, w == focused_window);
+        bx += bw + 4;
+    }
+
+    int cw = gfx_text_w(clock_text, 1);
+    gfx_text(gfx_width() - cw - 8, y + 9, clock_text, C_TEXT, 1);
+}
+
+static void cursor_erase(void)
+{
+    u32 *bb = gfx_backbuffer();
+
+    if (!cursor_saved || cur_x < 0 || cur_y < 0)
+        return;
+    if (!bb)
+        return;
+    for (int j = 0; j < CURSOR_H; j++) {
+        for (int i = 0; i < CURSOR_W; i++) {
+            int x = cur_x + i, y = cur_y + j;
+            if (x >= 0 && x < gfx_width() && y >= 0 && y < gfx_height())
+                bb[y * gfx_width() + x] = cursor_under[j * CURSOR_W + i];
+        }
+    }
+    cursor_saved = 0;
+}
+
+static void cursor_save(void)
+{
+    if (cur_x < 0 || cur_y < 0)
+        return;
+    for (int j = 0; j < CURSOR_H; j++) {
+        for (int i = 0; i < CURSOR_W; i++) {
+            int x = cur_x + i, y = cur_y + j;
+            u32 c = 0;
+            if (x >= 0 && x < gfx_width() && y >= 0 && y < gfx_height())
+                c = gfx_backbuffer()[y * gfx_width() + x];
+            cursor_under[j * CURSOR_W + i] = c;
+        }
+    }
+    cursor_saved = 1;
+}
+
+static void cursor_restore(void)
+{
+    if (!cursor_saved || cur_x < 0 || cur_y < 0)
+        return;
+    rect_t old = gfx_get_clip();
+    gfx_reset_clip();
+    for (int j = 0; j < CURSOR_H; j++)
+        for (int i = 0; i < CURSOR_W; i++)
+            gfx_pixel(cur_x + i, cur_y + j, cursor_under[j * CURSOR_W + i]);
+    gfx_set_clip_rect(old);
+    cursor_saved = 0;
+}
+
+static void cursor_paint(void)
+{
+    if (cur_x < 0 || cur_y < 0)
+        return;
+    rect_t old = gfx_get_clip();
+    gfx_reset_clip();
+    for (int j = 0; j < CURSOR_H; j++) {
+        const char *row = cursor_shape[j];
+        for (int i = 0; i < CURSOR_W && row[i]; i++) {
+            if (row[i] == '1')
+                gfx_pixel(cur_x + i, cur_y + j, RGB(20, 20, 24));
+            else if (row[i] == '2')
+                gfx_pixel(cur_x + i, cur_y + j, RGB(245, 248, 255));
+        }
+    }
+    gfx_set_clip_rect(old);
+}
+
+static void cursor_move_to(int nx, int ny)
+{
+    if (nx == cur_x && ny == cur_y)
+        return;
+
+    int old_x = cur_x, old_y = cur_y;
+    cursor_restore();
+    if (old_x >= 0)
+        gfx_present_rect(old_x - 1, old_y - 1, CURSOR_W + 2, CURSOR_H + 2);
+
+    cur_x = nx;
+    cur_y = ny;
+    cursor_save();
+    cursor_paint();
+    gfx_present_rect(cur_x - 1, cur_y - 1, CURSOR_W + 2, CURSOR_H + 2);
+}
+
+void gui_cursor_refresh(void)
+{
+    int mx, my, mb;
+
+    mouse_get(&mx, &my, &mb);
+    if (mx != cur_x || my != cur_y) {
+        cursor_move_to(mx, my);
+        return;
+    }
+    if (cur_x < 0)
+        return;
+    cursor_saved = 0;
+    cursor_restore();
+    cursor_save();
+    cursor_paint();
+    gfx_present_rect(cur_x - 1, cur_y - 1, CURSOR_W + 2, CURSOR_H + 2);
+}
+
+static int in_rect(int x, int y, int rx, int ry, int rw, int rh)
+{
+    return x >= rx && x < rx + rw && y >= ry && y < ry + rh;
+}
+
+static window_t *window_at(int x, int y)
+{
+    for (int i = zcount - 1; i >= 0; i--) {
+        window_t *w = zorder[i];
+        if ((w->flags & WIN_FRAMELESS) == 0 &&
+            in_rect(x, y, w->x, w->y, w->w, w->h))
+            return w;
+    }
+    return NULL;
+}
+
+static void app_mouse(window_t *w, int x, int y, int buttons, int event)
+{
+    if (!w || !w->app->mouse)
+        return;
+    w->app->mouse(w, x - w->cx, y - w->cy, buttons, event);
+}
+
+static void mouse_event(int event, int x, int y, int buttons)
+{
+    if (event == GUI_MOUSE_DOWN) {
+        if (start_menu_open) {
+            int mx = menu_x(), my = menu_y();
+            int mh = MENU_ITEMS * MENU_ITEM_H + 8;
+            if (in_rect(x, y, mx, my, MENU_W, mh)) {
+                int idx = (y - my - 4) / MENU_ITEM_H;
+                if (idx >= 0 && idx < MENU_ITEMS) {
+                    start_menu_open = 0;
+                    gui_dirty();
+                    gui_open(menu_apps[idx]);
+                }
+                return;
+            }
+            start_menu_open = 0;
+            gui_dirty();
+        }
+
+        int ty = gfx_height() - GUI_TASKBAR_H;
+        if (y >= ty) {
+            if (in_rect(x, y, 4, ty + 4, 52, 18)) {
+                start_menu_open = !start_menu_open;
+                gui_dirty();
+                return;
+            }
+            int bx = 62;
+            for (int i = 0; i < zcount; i++) {
+                window_t *w = zorder[i];
+                int bw = gfx_text_w(w->app->title, 1) + 16;
+                if (bx + bw > gfx_width() - 70)
+                    break;
+                if (in_rect(x, y, bx, ty + 4, bw, 18)) {
+                    gui_focus(w);
+                    return;
+                }
+                bx += bw + 4;
+            }
+            return;
+        }
+
+        window_t *w = window_at(x, y);
+        if (!w) {
+            int idx;
+            if (icon_at(x, y, &idx)) {
+                desktop_icon_t *ic = &icons[idx];
+                icon_selected = idx;
+                if (ic->is_folder) {
+                    extern void app_files_open_at(const char *path);
+                    gui_open(&app_files);
+                    app_files_open_at(ic->path);
+                } else if (ic->is_system) {
+                    gui_open(menu_apps[ic->app_index]);
+                } else {
+                    extern void term_run_program(const char *path);
+                    term_run_program(ic->path);
+                }
+                gui_dirty();
+            }
+            return;
+        }
+
+        gui_focus(w);
+        GTRACE("[mouse] down %d,%d -> '%s' win=%d,%d %dx%d\n", x, y,
+               w->app->title, w->x, w->y, w->w, w->h);
+
+        if (in_rect(x, y, w->x + w->w - 18, w->y + 4, 14, 13)) {
+            gui_close(w);
+            return;
+        }
+        if (y < w->cy) {
+            dragging = 1;
+            drag_dx = x - w->x;
+            drag_dy = y - w->y;
+            mouse_grab = w;
+            return;
+        }
+        mouse_grab = w;
+        app_mouse(w, x, y, buttons, GUI_MOUSE_DOWN);
+        return;
+    }
+
+    if (event == GUI_MOUSE_UP) {
+        if (dragging) {
+            dragging = 0;
+            return;
+        }
+        if (mouse_grab) {
+            app_mouse(mouse_grab, x, y, buttons, GUI_MOUSE_UP);
+            mouse_grab = NULL;
+        }
+        return;
+    }
+
+    if (dragging && mouse_grab) {
+        window_t *w = mouse_grab;
+        int nx = x - drag_dx;
+        int ny = y - drag_dy;
+        if (nx < -w->w + 40) nx = -w->w + 40;
+        if (ny < 0) ny = 0;
+        if (nx > gfx_width() - 40) nx = gfx_width() - 40;
+        if (ny > gfx_height() - GUI_TASKBAR_H - 20) ny = gfx_height() - GUI_TASKBAR_H - 20;
+        if (nx != w->x || ny != w->y) {
+            int ox = w->x, oy = w->y;
+            w->x = nx;
+            w->y = ny;
+            set_content_rect(w);
+            /* 旧位置与新位置都要刷新，其余区域不动 */
+            gui_dirty_rect(ox - 1, oy - 1, ox + w->w + 4, oy + w->h + 4);
+            gui_dirty_rect(w->x - 1, w->y - 1, w->x + w->w + 4, w->y + w->h + 4);
+        }
+        return;
+    }
+
+    if (mouse_grab && (buttons & MOUSE_LEFT)) {
+        app_mouse(mouse_grab, x, y, buttons, GUI_MOUSE_MOVE);
+        return;
+    }
+
+    /* 单纯移动：桌面图标热区、开始菜单项的高亮都依赖鼠标位置。
+       只标新位置的话，光标一移开，旧图标的高亮和旧光标都会留在屏幕上
+       （因为脏区不覆盖它们），看上去就是"局部刷新范围太小"。
+       所以脏区取【旧光标位置 ∪ 新光标位置】的包围盒，两边各扩一格图标宽。 */
+    {
+        int ox = (cur_x >= 0) ? cur_x : x;
+        int oy = (cur_y >= 0) ? cur_y : y;
+        int x0 = (ox < x ? ox : x) - ICON_W;
+        int y0 = (oy < y ? oy : y) - ICON_H;
+        int x1 = (ox > x ? ox : x) + CURSOR_W + ICON_W;
+        int y1 = (oy > y ? oy : y) + CURSOR_H + ICON_H;
+        gui_dirty_rect(x0, y0, x1, y1);
+    }
+}
+
+static void handle_mouse(void)
+{
+    static int last_x = -1, last_y = -1;
+    int x, y, b, ev;
+
+    while ((ev = mouse_next_event(&x, &y, &b)) != 0)
+        mouse_event(ev == MOUSE_EV_DOWN ? GUI_MOUSE_DOWN : GUI_MOUSE_UP, x, y, b);
+
+    mouse_get(&x, &y, &b);
+    if (x != last_x || y != last_y)
+        mouse_event(GUI_MOUSE_MOVE, x, y, b);
+    last_x = x;
+    last_y = y;
+}
+
+static int frames_drawn;
+
+#ifdef GUI_STATS
+static u32 stat_full, stat_partial, stat_area;
+#endif
+
+static int rect_overlaps(rect_t r, int x0, int y0, int x1, int y1)
+{
+    return !(x1 < r.x0 || x0 > r.x1 || y1 < r.y0 || y0 > r.y1);
+}
+
+/* 整屏重绘：桌面 -> 按 z 序画窗口 -> 任务栏 -> 开始菜单 -> 光标 -> 提交。
+   gui_poll 与 gui_close 共用，保证"结构变化"在任何上下文都能立即出现。 */
+void gui_repaint_all(void)
+{
+    int mx, my, mb;
+    u32 t0 = timer_ticks();
+
+    /* 万一调用点是某个窗口的 surface 渲染中途，先把目标切回屏幕 backbuffer */
+    gfx_target_end();
+    mouse_get(&mx, &my, &mb);
+
+    scene_dirty = 0;
+    dirty_valid = 0;
+
+    gfx_reset_clip();
+    for (int i = 0; i < zcount; i++)
+        draw_window(zorder[i]);      /* zorder[0] 是桌面 */
+    draw_taskbar();
+    draw_start_menu();
+
+    cur_x = mx;
+    cur_y = my;
+    gfx_reset_clip();
+    cursor_save();
+    cursor_paint();
+    gfx_present();
+    frames_drawn++;
+    GTRACE("[full] %d wins, %d ticks\n", zcount, (int)(timer_ticks() - t0));
+}
+
+/* 局部重绘：只刷新给定区域，桌面/窗口/任务栏都按 clip 裁剪 */
+static void repaint_rect(rect_t r)
+{
+    int i, mx, my, mb;
+
+    if (r.x0 < 0) r.x0 = 0;
+    if (r.y0 < 0) r.y0 = 0;
+    if (r.x1 > gfx_width() - 1) r.x1 = gfx_width() - 1;
+    if (r.y1 > gfx_height() - 1) r.y1 = gfx_height() - 1;
+    if (r.x0 > r.x1 || r.y0 > r.y1)
+        return;
+
+    mouse_get(&mx, &my, &mb);
+#ifdef GUI_TRACE
+    u32 t_start = timer_ticks();
+#endif
+
+    /* 光标落在脏区里：先把它占的像素还回去，重绘完再画 */
+    if (cursor_saved && cur_x >= 0 && cur_y >= 0 &&
+        rect_overlaps(r, cur_x, cur_y, cur_x + CURSOR_W - 1, cur_y + CURSOR_H - 1))
+        cursor_erase();
+
+    gfx_set_clip_rect(r);
+    for (i = 0; i < zcount; i++) {
+        window_t *w = zorder[i];
+        if (w && rect_overlaps(r, w->x - 1, w->y - 1, w->x + w->w + 4, w->y + w->h + 4))
+            draw_window(w);
+    }
+    draw_taskbar();
+    draw_start_menu();
+    gfx_reset_clip();
+
+    cur_x = mx;
+    cur_y = my;
+    cursor_save();
+    cursor_paint();
+    gfx_present_rect(r.x0, r.y0, r.x1 - r.x0 + 1, r.y1 - r.y0 + 1);
+    frames_drawn++;
+#ifdef GUI_TRACE
+    GTRACE("[part] %d,%d-%d,%d %d px %d ticks\n", r.x0, r.y0, r.x1, r.y1,
+           (r.x1 - r.x0 + 1) * (r.y1 - r.y0 + 1), (int)(timer_ticks() - t_start));
+#endif
+#ifdef GUI_STATS
+    stat_partial++;
+    stat_area += (u32)(r.x1 - r.x0 + 1) * (u32)(r.y1 - r.y0 + 1);
+    if ((stat_full + stat_partial) % 64 == 0) {
+        kprintf("[gui] repaint full=%u partial=%u avg_area=%u px (screen=%u)\n",
+                stat_full, stat_partial,
+                stat_partial ? (u32)(stat_area / stat_partial) : 0,
+                (u32)gfx_width() * (u32)gfx_height());
+        stat_area = 0;
+        stat_partial = 0;
+    }
+#endif
+}
+
+static void clock_rect(rect_t *r)
+{
+    int ty = gfx_height() - GUI_TASKBAR_H;
+    int w = gfx_text_w("00:00:00", 1);
+
+    r->x0 = gfx_width() - w - 12;
+    r->y0 = ty + 1;
+    r->x1 = gfx_width() - 2;
+    r->y1 = gfx_height() - 1;
+}
+
+static void redraw_clock(void)
+{
+    rect_t r, old;
+    int w, h;
+
+    clock_rect(&r);
+    if (frames_drawn == 0) {
+        scene_dirty = 1;
+        return;
+    }
+    if (cur_x >= 0 && cur_y >= 0 && cur_x + CURSOR_W >= r.x0 &&
+        cur_x <= r.x1 && cur_y + CURSOR_H >= r.y0 && cur_y <= r.y1) {
+        scene_dirty = 1;
+        return;
+    }
+
+    old = gfx_get_clip();
+    gfx_set_clip_rect(r);
+    w = r.x1 - r.x0 + 1;
+    h = r.y1 - r.y0 + 1;
+    gfx_fill_rect(r.x0, r.y0, w, h, C_TASKBAR);
+    gfx_text(r.x0 + 4, r.y0 + 8, clock_text, C_TEXT, 1);
+    gfx_set_clip_rect(old);
+    gfx_present_rect(r.x0, r.y0, w, h);
+}
+
+static void update_clock(void)
+{
+    icons_poll();
+    if (timer_ticks() - clock_tick < timer_hz() / 2)
+        return;
+    clock_tick = timer_ticks();
+
+    rtc_time_t t;
+    rtc_read(&t);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d", t.hour, t.minute, t.second);
+    if (strcmp(buf, clock_text) != 0) {
+        strcpy(clock_text, buf);
+        redraw_clock();
+    }
+}
+
+void gui_init(void)
+{
+    memset(windows, 0, sizeof(windows));
+    zcount = 0;
+    focused_window = NULL;
+    scene_dirty = 1;
+    start_menu_open = 0;
+    cursor_saved = 0;
+    cur_x = -1;
+    cur_y = -1;
+
+    mouse_set_bounds(gfx_width(), gfx_height());
+    mouse_set_position(gfx_width() / 2, gfx_height() / 2);
+
+    /* 桌面作为一个窗口进入 z 序（最底层） */
+    memset(&desk_win, 0, sizeof(desk_win));
+    desk_win.app = &app_desktop;
+    desk_win.x = 0;
+    desk_win.y = 0;
+    desk_win.w = gfx_width();
+    desk_win.h = gfx_height();
+    desk_win.cx = 0;
+    desk_win.cy = 0;
+    desk_win.cw = gfx_width();
+    desk_win.ch = gfx_height();
+    desk_win.level = -1;
+    desk_win.flags = WIN_FRAMELESS;
+    desk_win.used = 1;
+    zorder_insert(&desk_win);
+
+    kprintf("[gui] desktop %dx%d, taskbar %dpx\n", gfx_width(), gfx_height(),
+            GUI_TASKBAR_H);
+}
+
+void gui_set_input(int enabled)
+{
+    input_enabled = enabled;
+}
+
+void gui_poll(void)
+{
+    int k;
+
+    if (!input_enabled) {
+        if (scene_dirty)
+            gui_repaint_all();
+        return;
+    }
+
+    while ((k = keyboard_getkey()) != -1) {
+        window_t *target = focused_window;
+        if (!target || !target->app->key) {
+            /* fallback: route keys to the terminal window */
+            for (int i = zcount - 1; i >= 0; i--) {
+                window_t *w = zorder[i];
+                if (w && w->app && w->app->key && w->app->title &&
+                    !strcmp(w->app->title, "Terminal")) {
+                    target = w;
+                    break;
+                }
+            }
+        }
+        if (target && target->app->key) {
+            target->app->key(target, k, keyboard_mods());
+            /* 按键通常改变了界面状态：不管 app 自己有没有标脏，都重排该窗口，
+               否则"被动刷新"（打字、翻页等）在屏幕上永远看不到 */
+            gui_dirty_window(target);
+        }
+    }
+
+    int mx, my, mb;
+    mouse_get(&mx, &my, &mb);
+    int moved = (mx != cur_x || my != cur_y);
+
+    handle_mouse();
+    update_clock();
+
+    /* 每个窗口都跑 tick：后台窗口自己更新的内容（动画、进度、时钟类界面）
+       也要有机会标脏，否则必须等鼠标经过才会刷新 */
+    for (int i = 0; i < zcount; i++) {
+        window_t *tw = zorder[i];
+        if (tw && tw->app->tick)
+            tw->app->tick(tw);
+    }
+
+    if (scene_dirty) {
+        gui_repaint_all();
+#ifdef GUI_STATS
+        stat_full++;
+#endif
+    } else if (dirty_valid) {
+        rect_t r = dirty;
+        dirty_valid = 0;
+        repaint_rect(r);
+    } else if (moved) {
+        cursor_move_to(mx, my);
+    }
+}
+
+void gui_run(void)
+{
+    for (;;) {
+        gui_poll();
+        hlt();
+    }
+}

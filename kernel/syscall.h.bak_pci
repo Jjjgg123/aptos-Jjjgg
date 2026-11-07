@@ -1,0 +1,75 @@
+#ifndef APTOS_SYSCALL_H
+#define APTOS_SYSCALL_H
+
+#include "idt.h"
+#include "types.h"
+
+#define SYS_EXIT        0
+#define SYS_WRITE       1
+#define SYS_READKEY     2
+#define SYS_OPEN        3
+#define SYS_CLOSE       4
+#define SYS_READ        5
+#define SYS_MKDIR       6
+#define SYS_UNLINK      7
+#define SYS_LIST        8
+#define SYS_SLEEP       9
+#define SYS_TIME        10
+#define SYS_GETKEY      11
+#define SYS_ARGS        12
+#define SYS_PKG_OPEN    13
+#define SYS_PKG_COUNT   14
+#define SYS_PKG_INFO    15
+#define SYS_PKG_EXTRACT 16
+#define SYS_EXISTS      17
+#define SYS_ISDIR       18
+#define SYS_ABOUT       19
+#define SYS_WIN_OPEN    20
+#define SYS_WIN_CLEAR   21
+#define SYS_GFX_RECT    22
+#define SYS_GFX_TEXT    23
+#define SYS_WIN_FLUSH   24
+#define SYS_MOUSE       25
+#define SYS_WIN_FRAME   26
+#define SYS_WIN_SIZE    27
+#define SYS_PUMP        28
+#define SYS_TICKS       29
+#define SYS_POWEROFF    30
+#define SYS_BOOTMODE    31
+#define SYS_RAWWRITE    32
+#define SYS_INSTALL     33
+#define SYS_REBOOT      34
+#define SYS_DISK_INFO   35
+#define SYS_INSTALL_FAT 36
+#define SYS_BRK         37
+#define SYS_FILEWRITE   38
+#define SYS_GFX_LINE    39
+#define SYS_BEEP        40
+#define SYS_SYSINFO     41
+#define SYS_NET_INFO     42
+#define SYS_TCP_CONNECT  43
+#define SYS_TCP_SEND     44
+#define SYS_TCP_RECV     45
+#define SYS_TCP_CLOSE    46
+#define SYS_DNS_QUERY    47
+#define SYS_TCP_LISTEN   48
+#define SYS_TCP_ACCEPT   49
+#define SYS_GFX_BLIT     50
+#define SYS_SPAWN        51
+#define SYS_WAIT         52
+#define SYS_KILL         53
+#define SYS_GETPID       54
+#define SYS_PROCINFO     55
+#define SYS_MMAP         56
+#define SYS_MUNMAP       57
+#define SYS_WIN_EVENT    58
+
+#define USER_FD_STDOUT  1
+#define USER_FD_STDERR  2
+
+void syscall_init(void);
+void syscall_dispatch(regs_t *r);
+void syscall_set_output(void (*fn)(const char *buf, u32 len));
+void syscall_set_args(const char *a0, const char *a1);
+
+#endif
