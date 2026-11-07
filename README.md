@@ -1,4 +1,4 @@
-﻿# aptos —— 一个能跑起来的 32 位小操作系统
+# aptos —— 一个能跑起来的 32 位小操作系统
 
 用 C 写的玩具操作系统：自带两段式引导程序、VBE 图形界面、窗口管理器、PS/2 键鼠驱动、
 块设备层（多硬盘 / 软盘 / ATAPI CD-ROM）、VFS 挂载、自制**层级文件系统**、
@@ -270,8 +270,8 @@ BIOS
    ...    .bss + 64 KiB 内核栈（栈顶 = _kernel_end）
 0x0A0000 ─ 0x0FFFFF  VGA 显存窗口 / 视频 BIOS / EBDA —— 不是普通 RAM
 0x100000  内核堆（bump 分配）：后备缓冲、位图、画布、DMA 缓冲
-0x40000000 用户程序代码/数据（4 KiB 页，U/S=1）
-0x47FF0000 用户栈（64 KiB）
+0xC0000000 用户程序代码/数据（4 KiB 页，U/S=1）
+0xEF800000 用户栈顶（192 KiB，向下增长）
 0xFD000000 VBE 线性帧缓冲（每个像素直接写这里）
 ```
 
@@ -285,7 +285,7 @@ BIOS
 恒等映射   0 .. mem_top   （mem_top = E820 里最高的可用地址，上限 0xC0000000）
            4 KiB 细页，不依赖 CR4.PSE，老 CPU 也能跑
 帧缓冲     按 BOOTINFO->fb_addr 单独映射（新 QEMU 在 0xFD000000，老 QEMU/Limbo 在 0xE0000000）
-用户空间   0x40000000 起，4 KiB 细页，U/S=1
+用户空间   0xC0000000 起，4 KiB 细页，U/S=1
 ```
 
 于是同一份镜像能自适应：16 MiB 的老机器映射 16 MiB，**1 GiB 的机器映射 1 GiB**
@@ -427,49 +427,76 @@ PM1a_CNT_BLK  : 0x604   PM1b 0x0
 `poweroff` 往里写 `(5 << 10) | SLP_EN` 触发 **S5 软关机**，QEMU 会真的退出进程——
 这不是 `cli; hlt` 那种假关机。
 
-### 3.7 用户态
+### 3.7 用户态与多任务
 
-分页 + ring 3 + TSS + `int 0x80`，一个进程，跑完回到 shell：
+分页 + ring 3 + TSS + `int 0x80` + 抢占式调度。最多 8 个任务，时间片 50 ms（100 Hz × 5 tick），每个用户进程一套独立页目录，退出后先进僵尸态再回收。
 
 ```
 GDT：0x08 内核代码 / 0x10 内核数据 / 0x1B 用户代码 / 0x23 用户数据 / 0x28 TSS
-TSS：ss0 = 0x10，esp0 指向 32 KiB 内核栈 —— ring3 → ring0 时 CPU 自动切栈
+TSS：ss0 = 0x10，esp0 指向每任务 32 KiB 内核栈 —— ring3 → ring0 时 CPU 自动切栈
 IDT：向量 0x80 是 DPL=3 的中断门，用户态才能 int 进去
 入口：kernel/usermode.asm 的 user_enter 压好 SS/ESP/EFLAGS/CS/EIP 后 iret
 退出：user_exit_asm 把 ESP 换回进内核时保存的那份，ret 回到 C 调用点
+切换：定时器中断里 scheduler_poll() 递减时间片，用完调用 switch_to() 换内核栈
 ```
 
-用户程序是**真正的 ELF32 可执行文件**：链接在 0x40000000，`kernel/elf.c`
+用户程序是**真正的 ELF32 可执行文件**：链接在 `0xC0000000`，`kernel/elf.c`
 遍历 program header，按 PT_LOAD 分配物理页、拷贝段内容、映射成用户可读写，
 最后 iret 到 `e_entry`。用户指针进内核前一律过 `paging_user_range_ok()`。
 
-系统调用表（`eax` = 号，`ebx/ecx/edx/esi` = 参数，返回值在 `eax`）：
+启动新进程走 `spawn <路径>`：内核读文件、建页目录、装 ELF、挂进任务表，
+父进程可以用 `wait` 阻塞等子进程退出码，也可以用 `kill` 直接杀掉。
 
-| # | 调用 | # | 调用 |
+系统调用共 67 个（`eax` = 号，`ebx/ecx/edx/esi` = 参数，返回值在 `eax`）。
+下面按用途分组，完整编号以 `kernel/syscall.h` 为准：
+
+| # | 文件与进程 | # | 图形与输入 |
 |---|---|---|---|
-| 0 | exit | 10 | time（RTC 六元组） |
-| 1 | write(fd, buf, len) | 11 | getkey（非阻塞） |
-| 2 | readkey（阻塞等键） | 12 | args(index, buf, size) |
-| 3 | open(path, mode) | 13 | pkg_open(path) |
-| 4 | close(fd) | 14 | pkg_count(h) |
-| 5 | read(fd, buf, len) | 15 | pkg_info(h, i, name) |
-| 6 | mkdir(path) | 16 | pkg_extract(h, i, dest) |
-| 7 | unlink(path) | 17 | exists(path) |
-| 8 | list(path, i, buf, size) | 18 | isdir(path) |
-| 9 | sleep(ms) | 19 | about（版本字符串） |
-| 29 | ticks（PIT 计数） | 30 | poweroff（ACPI S5） |
-| 31 | bootmode（启动盘号） | 32 | rawwrite(dev,lba,buf,count) |
-| 33 | install(dev, base)（建 FS 并挂到 /TARGET） | | |
-| 20 | win_open(title, w, h) | 24 | win_flush（贴到屏幕） |
-| 21 | win_clear(color) | 25 | mouse(&x, &y, &btn, &inside) |
-| 22 | gfx_rect(x,y,w,h,color) | 26 | win_frame（画边框） |
-| 23 | gfx_text(x,y,s,color,scale) | 27 | win_size() |
-| 28 | pump（只重绘鼠标指针） | | |
+| 0 | exit | 20 | win_open(title, w, h) |
+| 1 | write(fd, buf, len) | 21 | win_clear(color) |
+| 2 | readkey（阻塞等键） | 22 | gfx_rect(x,y,w,h,color) |
+| 3 | open(path, mode) | 23 | gfx_text(x,y,s,color,scale) |
+| 4 | close(fd) | 24 | win_flush（贴到屏幕） |
+| 5 | read(fd, buf, len) | 25 | mouse(&x,&y,&btn,&inside) |
+| 6 | mkdir(path) | 26 | win_frame |
+| 7 | unlink(path) | 27 | win_size() |
+| 8 | list(path, i, buf, size) | 28 | pump（只重绘鼠标指针） |
+| 9 | sleep(ms) | 39 | gfx_line |
+| 10 | time（RTC 六元组） | 50 | gfx_blit |
+| 11 | getkey（非阻塞） | 58 | win_event |
+| 12 | args(index, buf, size) | | |
+| 17 | exists(path) | | **时间与电源** |
+| 18 | isdir(path) | 29 | ticks（PIT 计数） |
+| 19 | about（版本字符串） | 30 | poweroff（ACPI S5） |
+| 37 | brk | 34 | reboot |
+| 38 | filewrite | | |
+| 51 | spawn(path, arg0, arg1) | | **磁盘与安装** |
+| 52 | wait(pid) | 31 | bootmode（启动盘号） |
+| 53 | kill(pid) | 32 | rawwrite(dev,lba,buf,count) |
+| 54 | getpid | 33 | install(dev, base) |
+| 55 | procinfo(pid, buf) | 35 | disk_info |
+| | | 36 | install_fat |
+
+| # | 系统信息 | # | 网络 |
+|---|---|---|---|
+| 41 | sysinfo | 42 | net_info |
+| 59 | pci | 43 | tcp_connect |
+| 61 | pci_bar | 44 | tcp_send |
+| 56 | mmap | 45 | tcp_recv |
+| 57 | munmap | 46 | tcp_close |
+| 63 | serial_getc | 47 | dns_query |
+| 64 | port_in | 48 | tcp_listen |
+| 65 | port_out | 49 | tcp_accept |
+| 66 | mmap_io | 62 | net_setip |
+| 40 | beep / 60 printn | | |
 
 20–28 这几个是给**用户态图形应用**用的：`win_open` 让内核给它开一个带画布的窗口，
 后面所有绘制都画进这块画布，`win_flush` 一次性贴到屏幕上（只重绘窗口那一块）。
 `mouse` 返回的是**相对窗口内容区**的坐标，所以游戏里直接拿来当牌位坐标用。
 鼠标指针由 `pump` 单独刷新，不用整屏重绘。
+
+夜话：`port_in` / `port_out` / `mmap_io` 让用户态程序能自己摸硬件 —— 写 PCI 驱动、
+读设备 BAR、直接控寄存器，都在 ring 3 里做，不用改内核。
 
 ### 3.8 `.lst` 应用包与安装程序
 
@@ -700,20 +727,28 @@ ATA 的扇区计数寄存器**只有 8 位**，一次命令最多 255 个扇区�
 
 ## 8. 已知限制
 
-* 没有分页、没有用户态、没有进程调度——所有东西跑在 ring 0，单线程事件循环。
-* 没有 `free()`：内核只在启动阶段分配，之后不再释放。
-* 文件仍按连续块分配、目录项数组也是连续块，所以长时间反复增删后会产生空洞（没有整理/碎片回收）。
-* 没有崩溃一致性保证：断电可能留下半写的目录项或漏掉的位图位（没有日志、没有 fsck）。
-* 目录层级没有深度限制，但单个目录最多 512 个条目、单次路径不超过 256 字节。
-* 硬盘/光驱都是 PIO 轮询（软驱用了 DMA，但也是同步轮询结果阶段），没有中断驱动的 I/O。
-* 内存上限 3 GiB（`0xC0000000`）：32 位内核寻址 4 GiB，再往上一般是 PCI 空洞。
-* 堆是 bump 分配、**不回收**，所以 `memtest` 这种大分配会一直占着；重启即可恢复。
-* 用户态同时只有一个进程，没有调度、没有 fork/exec、没有内存回收（退出即回收页表项）。
-* 用户程序必须是静态 ELF32（无动态链接、无 libc），链接地址固定 0x40000000。
-* 没有实现 APIC/IOAPIC，ACPI 只用来读表和关机，中断仍然走 8259 PIC。
-* 挂载表最多 6 个挂载点；ISO9660 只实现了 PVD + 目录记录遍历，没有 Rock Ridge / Joliet，
-  所以长文件名会被截成 8.3 式的大写名。
-* 文件名的中文/长名不支持（40 字节大写 ASCII）。
+**没有的东西：**
+
+* 没有 `fork` / `execve` 式的进程派生，只有 `spawn <路径>` 按文件路径起一个新进程。
+* 内核堆没有 `free()`，`kmalloc` 是 bump 分配，只在启动和加载阶段用。
+* 没有崩溃一致性保证：断电可能留下半写的目录项或漏掉的位图位（没有日志、没有 `fsck`）。
+* 文件仍按连续块分配、目录项数组也是连续块，长时间反复增删后会产生空洞。
+* 硬盘/光驱都是 PIO 轮询，没有中断驱动的 I/O。
+* 没有实现 APIC / IOAPIC，ACPI 只用来读表和关机，中断仍然走 8259 PIC。
+
+**有，但规模是这样的：**
+
+* 有分页、有 ring 3、有抢占式多任务：最多 8 个任务，50 ms 时间片，
+  每个用户进程一套独立页目录，退出后先进僵尸态再回收。
+* 内存上限 3 GiB（`0xC0000000` 以上留给用户态与 PCI 空洞）。
+* 单个目录初始 256 项，满了按 2 倍增长，上限 4096 项；单条路径不超过 256 字节。
+* 挂载表最多 6 个挂载点。
+* 用户程序必须是静态 ELF32（无动态链接、无 libc），链接地址固定 `0xC0000000`。
+
+**格式与硬件上的取舍：**
+
+* ISO9660 只实现了 PVD + 目录记录遍历，没有 Rock Ridge / Joliet，长文件名会被截成 8.3 式大写名。
+* 文件名只支持 40 字节大写 ASCII，中文和长名不行。
 * 8bpp 回退模式（VGA mode 13h）下桌面只有 320×200，窗口会被压得很小。
 
 ## 9. 继续玩下去可以做什么
